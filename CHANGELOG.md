@@ -3,6 +3,78 @@
 All notable changes to Solo+ are documented here.
 The project is an unofficial runtime enhancement layer for Solo 1.0.1.
 
+## 1.3.12 — 2026-11-24（桌面语境自证武装：attach 就地开宽限，不再追事件时序）
+
+1.3.11 实机日志（attach 带 grace 状态）实锤：SBStatusBarWindow 的 attach 全部
+`grace=0`——**收起转场中途的实例挂载早于一切事件信号**，靠事件武装宽限（四回调、
+兜底信号）在时序上永远赶不上。转而采用 Lunora 同款的前台信号方案：
+
+- **新增 `SpringBoard frontDisplayDidChange:` 钩**（Lunora 用它做场景判定）：只判
+  参数 nil 与非 nil 得到确定的「App 前台 vs 桌面/CC」状态，不解参数类型避开 ABI
+  漂移；该钩至少触发过一次才启用自证（未触发时回退 1.3.11 行为，不误伤）。
+- **桌面语境自证武装**：attach / 隐藏 / 显示 / 布局四个入口，只要「无前台 App +
+  主题在场 + overlay 声明了胶囊」就**当场开 2.5s 宽限并让位**——收起转场中途
+  重建的实例在首次渲染前即被记忆/声明 rect 让位，时序差不再存在。
+- **主题在场证据保鲜**：`gThemeSeenAt` 原先只在胶囊真实生效时更新，CC 开久了会
+  过期导致收起瞬间自证失败；现在声明态检查也刷新。
+- 进 App（frontDisplay 变化）立即清宽限并恢复让位，App 状态栏完整由前台信号硬
+  保护；CC 窗口条的隐藏也刷新兜底信号时间锚。
+
+## 1.3.11 — 2026-11-24（转场起点武装宽限：修收起转场中途重建实例的时序差）
+
+1.3.10 实机日志（`cc diag: attach`）定位到真正根因：`_willBeginTransition` 在**收起
+转场开始时**同样触发，此前把它当「CC 打开」清掉了宽限 → 收起转场**中途**系统重建
+桌面状态栏实例时宽限为空 → 实例按 1.3.6 规则渲染原生右列 → 等转场结束
+`_didEndTransition`/`_didDismiss` 才武装宽限，晚了一个转场。日志证据：attach 诊断
+全部落在 CC 打开期间（兜底信号误武装、无害），收起瞬间的新实例 attach 反而没有
+诊断行（宽限未武装）。
+
+修复：
+
+- `_willBeginTransition` 改为**武装**宽限（转场起点即覆盖）。打开方向随后由
+  `_willPresent` 清掉；收起方向从转场开始到结束再到 2.5s 宽限全程有让位保护，
+  转场中途重建的实例在首次渲染前就被记忆/声明 rect 让位；
+- `_didEndTransition` / `_didDismiss` 保持武装（收尾续期）；
+- attach 诊断放宽为「宽限内或主题 10s 内在场」即打印，并附带 grace 状态——
+  收起期 attach 是否抢在宽限武装之前，日志里直接可见。
+
+## 1.3.10 — 2026-11-24（宽限期加固：记忆 rect 让位 + CC 收起兜底信号）
+
+1.3.9 实机（iPhone 15 Pro / 17.2.1 + Lunora）反馈闪切依旧。复盘出宽限期三个未覆盖
+的洞，全部补上：
+
+- **记忆 rect 让位**：每次成功让位记住胶囊 rect（前景视图坐标系，跨实例几何一致）。
+  CC 收起窗口期若 overlay 尚未挂回条里（新实例挂载早于 Lunora 重新挂 overlay，
+  `sp_theme_overlay_for` 拿到 nil，1.3.9 的宽限分支根本没机会跑）或声明态也拿不到
+  （胶囊子视图被转场期隐藏），用记忆 rect 继续让位。仅在宽限内且主题最近在场
+  （10s 内见过胶囊）时生效，Lunora 被禁用不会误让。
+- **CC 收起兜底信号**：`SBControlCenterController` 四回调万一未装上/签名漂移时，
+  用「CC 窗口条（SBControlCenterWindow）最近走过显示路径 + 主屏出现隐藏调用 +
+  主题最近在场」推断 CC 刚收起，照样开宽限（无 CC 场景不会误触发）。
+- **宽限 1.2s → 2.5s**：覆盖 Lunora 姿态等待（40ms 轮询 deadline）+ 8×125ms 恢复
+  的最坏叠加；布局重申路径在宽限过期且 overlay 仍缺失时回收记忆让位恢复原生。
+- **诊断独立预算**：CC 窗口期专用日志预算（32 条），不再与 blocked/ignored 共享
+  耗尽；attach 时输出 overlay/声明态快照，便于下一轮实机定位。
+
+## 1.3.9 — 2026-11-24（CC 收起宽限期：消 CC→主屏原生条闪现）
+
+1.3.7 时机同步实测后仅剩一处残留：CC 关闭回主屏的瞬间，Lunora 会先瞬时藏掉自己的
+overlay（胶囊不可见）但压制不停，1.3.6 的「胶囊无效→恢复整条」规则在此窗口把原生
+右列放出来，等 overlay 亮出再让位 → 呈现一次「原生右列 ↔ 胶囊」闪现。
+
+逆向 Lunora V2 2.0.0~beta38 定案其转场时序后（`analysis/lunora-2b38/REPORT.md`），
+本版加入**CC 收起宽限期**：
+
+- **事件源**：与 Lunora 同款钩 `SBControlCenterController` 的
+  `_didDismiss` / `_didEndTransition` / `_willPresent` / `_willBeginTransition`
+  四回调（ABI 守卫：2 参、返回 void；签名漂移时退回 1.3.6 行为）。收起即开启
+  1.2s 宽限（≈ Lunora 自身 8×125ms 有界恢复上限 + 余量），重新打开 CC 即退出。
+- **宽限期内**：让位判据从「胶囊有效可见」放宽为「胶囊已声明」（overlay 被藏但
+  胶囊 frame 仍在——Lunora 转场不清 frame）。保持让位、不恢复整条，CC 回主屏
+  瞬间右侧短暂留白，胶囊亮出后无缝衔接；超时回退 1.3.6 的恢复整条规则。
+- 挂载同步（didMoveToWindow）、布局重申（layoutSubviews）、setAlpha: 显示/隐藏
+  路径全部统一走宽限感知的让位函数；无主题时行为不变（宽限只在覆盖层存在时生效）。
+
 ## 1.3.8 — 2026-11-24（iOS 16.5 加固：主题覆盖层误判防护）
 
 1.3.7 双机验收通过后，针对 16.5 旧状态栏（`_UIStatusBar`）补一条防护：主题覆盖层识别

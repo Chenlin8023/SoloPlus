@@ -225,6 +225,9 @@ static void (*sp_orig_setAlpha_st)(id, SEL, CGFloat) = NULL;
 // 共存规则（1.3.6）：覆盖层"存在"即算主题在场（Lunora 转场时会瞬时 hidden 自己的
 // overlay 却继续压制原生条，可见性不能作判据）；整条保活交给 Solo，胶囊"有效可见"
 // 时才让位，覆盖层藏掉期间整条原生条都听 Solo。
+// 宽限期修正（1.3.9）：CC 收起窗口期改按"胶囊已声明"让位、不恢复整条（消原生右列
+// 闪现），事件源=SBControlCenterController _didDismiss/_didEndTransition 四回调，
+// 超时回退本规则。逆向依据：analysis/lunora-2b38/REPORT.md。
 static char spSbYieldedKey = 0;      // 前景视图上记录被让位的子视图
 static int gYieldLogBudget = 12;
 
@@ -254,21 +257,145 @@ static BOOL sp_theme_capsules_effective(UIView *overlay) {
     return NO;
 }
 
+// ---- CC 收起宽限期（1.3.9 引入，1.3.10 加固）----
+// Lunora 转场时序（逆向定案，analysis/lunora-2b38/REPORT.md）：_didDismiss 后它把
+// ccReturnWaiting 置位、走 40ms 有界轮询等「姿态停稳」才重申压制（最坏 ~2s），
+// 期间自己的 overlay 会瞬时 hidden 但胶囊 frame 仍在（声明态）。1.3.9 实测仍有闪切，
+// 复盘出三个洞，1.3.10 全堵：
+//   ① 新前景实例挂载早于 overlay 挂回条里 → sp_theme_overlay_for 返回 nil，
+//      宽限分支没机会跑 → 改为「记忆 rect 让位」：成功让位时记住胶囊 rect，
+//      overlay 缺失/声明失效时也照让；
+//   ② 胶囊子视图可能被 Lunora 转场期隐藏 → 声明态收集不再跳过 hidden；
+//   ③ 1.2s 宽限短于 Lunora 姿态等待 → 2.5s；另加「CC 收起兜底信号」（四回调钩
+//      万一失效时用 CC 窗口条最近可见 + 主屏隐藏调用推断收起）。
+static double gCcGraceUntil = 0.0;         // CACurrentMediaTime 截止；0=无宽限
+static const double kCcGraceSeconds = 2.5; // Lunora 姿态等待 + 8×125ms 恢复，留足余量
+static int gCcGraceLogBudget = 12;
+static int gCcDiagLogBudget = 32;          // CC 窗口期专用诊断（独立于其它预算防耗尽）
+static double gCcBarSeenAt = -1e9;         // 最近一次 CC 窗口条走显示路径的时刻（兜底信号源）
+// 主题最近在场证据 + 最后一次成功让位的胶囊 rect（fgview 坐标系，跨实例几何一致）。
+static double gThemeSeenAt = -1e9;
+static CGRect gLastCapsRects[8];
+static int gLastCapsCount = 0;
+
+static BOOL gThemeSeenRecent(void) {
+    return CACurrentMediaTime() - gThemeSeenAt < 10.0;
+}
+
+// 覆盖层是否仍"声明"着胶囊：不看 overlay 可见性，只看胶囊 frame。
+// Lunora 转场藏 overlay 时不清 frame（frame 即美化区域声明），转场结束后亮回。
+static BOOL sp_theme_capsules_declared(UIView *overlay) {
+    if (!overlay) return NO;
+    for (UIView *cap in overlay.subviews)
+        if (cap.frame.size.width > 1.0f && cap.frame.size.height > 1.0f) return YES;
+    return NO;
+}
+
+static BOOL sp_cc_grace_active(void) {
+    if (gCcGraceUntil <= 0.0) return NO;
+    if (CACurrentMediaTime() >= gCcGraceUntil) { gCcGraceUntil = 0.0; return NO; }
+    return YES;
+}
+
+// ---- 前台语境（1.3.12）：Lunora 同款钩 SpringBoard frontDisplayDidChange: ----
+// 事件武装（四回调/兜底）实测永远赶不上收起转场中途的 attach（报告 17：SBStatusBarWindow
+// 的 attach 全部 grace=0）。改为"桌面语境自证武装"：attach/hide/display 时只要
+// 「无前台 App + 主题在场 + overlay 声明了胶囊」就当场开宽限并让位，不再依赖任何
+// 事件先到。App 语境由 frontDisplay 硬保护（该钩触发过才启用，防版本漂移误伤）。
+static BOOL gAppForeground = NO;    // frontDisplayDidChange 观测的前台 App 状态
+static BOOL gFrontDisplaySeen = NO; // 该钩至少触发过一次才启用自证武装
+
+// 桌面语境自证：就地武装宽限。顺带把主题在场证据保鲜（gThemeSeenAt 原先只在
+// 胶囊真实生效时更新，CC 开久了会过期导致收起瞬间自证失败）。
+static void sp_arm_grace_if_desktop(UIView *fgview, UIView *overlay) {
+    if (!overlay || !sp_theme_capsules_declared(overlay)) return;
+    gThemeSeenAt = CACurrentMediaTime();
+    if (gCcGraceUntil > 0.0 && CACurrentMediaTime() < gCcGraceUntil) return;
+    if (!gFrontDisplaySeen || gAppForeground) return;
+    gCcGraceUntil = CACurrentMediaTime() + kCcGraceSeconds;
+    if (gCcDiagLogBudget > 0) {
+        gCcDiagLogBudget--;
+        sp_log(@"cc diag: self-arm (desktop context, overlay=%@)",
+               NSStringFromClass([overlay class]));
+    }
+}
+
 // 把与可见胶囊重叠的原生内容子视图 alpha 压 0，并记录到关联对象。
 // 胶囊当前"无效可见"（overlay 被藏）时不让位并恢复，避免右/左侧双空。
 static void sp_restore_theme_yield(UIView *fgview); // 前向声明（下方定义）
 
+// CC 收起宽限期的"记忆 rect 让位"：overlay 缺失（挂载早于 Lunora 挂回）或声明态
+// 也拿不到时，用最近一次成功让位记住的胶囊 rect 继续 yield 右列。只在宽限内且
+// 主题最近在场时生效（Lunora 真被禁用不会误让）。
+static BOOL sp_grace_recall_yield(UIView *fgview) {
+    if (!sp_cc_grace_active() || !gThemeSeenRecent() || gLastCapsCount == 0) return NO;
+    NSMutableArray *yielded = objc_getAssociatedObject(fgview, &spSbYieldedKey)
+                              ?: [NSMutableArray array];
+    BOOL changed = NO;
+    for (UIView *sub in fgview.subviews) {
+        if (sub.hidden || sub.alpha < 0.01f) continue;
+        if ([yielded containsObject:sub]) continue;
+        BOOL hit = NO;
+        for (int i = 0; i < gLastCapsCount; i++)
+            if (CGRectIntersectsRect(sub.frame, gLastCapsRects[i])) { hit = YES; break; }
+        if (!hit) continue;
+        sub.alpha = 0.0f;
+        [yielded addObject:sub];
+        changed = YES;
+    }
+    if (changed || yielded.count)
+        objc_setAssociatedObject(fgview, &spSbYieldedKey, yielded,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (changed && gCcDiagLogBudget > 0) {
+        gCcDiagLogBudget--;
+        sp_log(@"cc diag: recall yield %lu sub(s) (overlay absent/undeclared, theme %.1fs ago)",
+               (unsigned long)yielded.count, CACurrentMediaTime() - gThemeSeenAt);
+    }
+    return YES;
+}
+
 static void sp_apply_theme_yield(UIView *fgview, UIView *overlay) {
-    if (!sp_theme_capsules_effective(overlay)) {
-        sp_restore_theme_yield(fgview);
-        return;
+    BOOL effective = sp_theme_capsules_effective(overlay);
+    BOOL graceDeclared = NO;
+    if (!effective) {
+        if (sp_cc_grace_active() && sp_theme_capsules_declared(overlay)) {
+            // CC 收起宽限期：胶囊尚不可见但 frame 仍声明 → 保持让位，不恢复整条。
+            graceDeclared = YES;
+            if (gCcGraceLogBudget > 0) {
+                gCcGraceLogBudget--;
+                sp_log(@"cc grace: yield by declared capsules (overlay=%@)",
+                       NSStringFromClass([overlay class]));
+            }
+        } else if (sp_cc_grace_active() && gThemeSeenRecent() && gLastCapsCount > 0) {
+            // 声明态也拿不到（转场期胶囊被藏/frame 被清）→ 记忆 rect 让位。
+            if (gCcDiagLogBudget > 0) {
+                gCcDiagLogBudget--;
+                sp_log(@"cc diag: declared missing on %@, recall",
+                       NSStringFromClass([overlay class]));
+            }
+            if (!sp_grace_recall_yield(fgview)) sp_restore_theme_yield(fgview);
+            return;
+        } else {
+            sp_restore_theme_yield(fgview);
+            return;
+        }
     }
     NSMutableArray *caps = [NSMutableArray array];
     for (UIView *cap in overlay.subviews) {
-        if (cap.hidden || cap.frame.size.width < 1.0f || cap.frame.size.height < 1.0f) continue;
+        // 宽限声明态不跳过 hidden：Lunora 转场可能整链隐藏，frame 才是有效声明。
+        if (!graceDeclared && cap.hidden) continue;
+        if (cap.frame.size.width < 1.0f || cap.frame.size.height < 1.0f) continue;
         [caps addObject:[NSValue valueWithCGRect:[fgview convertRect:cap.frame fromView:overlay]]];
     }
     if (caps.count == 0) return;
+    // 记录主题在场证据与胶囊 rect（记忆让位与兜底信号的依据）。
+    gThemeSeenAt = CACurrentMediaTime();
+    int n = 0;
+    for (NSValue *v in caps) {
+        if (n >= 8) break;
+        gLastCapsRects[n++] = [v CGRectValue];
+    }
+    gLastCapsCount = n;
     NSMutableArray *yielded = objc_getAssociatedObject(fgview, &spSbYieldedKey)
                               ?: [NSMutableArray array];
     BOOL changed = NO;
@@ -320,8 +447,26 @@ static void sp_sb_sync_on_attach(UIView *view) {
         return;
     }
     UIView *overlay = sp_theme_overlay_for(view);
-    if (overlay && sp_theme_capsules_effective(overlay)) sp_apply_theme_yield(view, overlay);
-    else sp_restore_theme_yield(view);
+    // 桌面语境自证武装（1.3.12）：attach 就地开宽限，收起转场中途的实例也能
+    // 首渲染前让位——不再依赖任何事件信号先到。
+    sp_arm_grace_if_desktop(view, overlay);
+    BOOL grace = sp_cc_grace_active();
+    // 主题在场就打印（不只宽限内）：收起转场中途的 attach 是否赶在宽限武装之前，
+    // 只有靠它才能看见（1.3.10 实测教训）。
+    if ((grace || gThemeSeenRecent()) && gCcDiagLogBudget > 0) {
+        gCcDiagLogBudget--;
+        sp_log(@"cc diag: attach win=%@ overlay=%@ caps=%d grace=%d",
+               NSStringFromClass([win class]),
+               overlay ? NSStringFromClass([overlay class]) : @"(nil)",
+               overlay ? (sp_theme_capsules_declared(overlay) ? 1 : 0) : -1,
+               grace ? 1 : 0);
+    }
+    // 统一走 apply：胶囊有效 → 让位；无效 → 宽限期内按声明/记忆 rect 让位，否则恢复。
+    if (overlay) {
+        sp_apply_theme_yield(view, overlay);
+    } else if (!sp_grace_recall_yield(view)) {
+        sp_restore_theme_yield(view);
+    }
 }
 
 static void sp_sb_assert_on_layout(UIView *view) {
@@ -329,7 +474,17 @@ static void sp_sb_assert_on_layout(UIView *view) {
     UIWindow *win = view.window;
     if (!win || !sp_window_is_home_context(win)) return;
     UIView *overlay = sp_theme_overlay_for(view);
-    if (overlay && sp_theme_capsules_effective(overlay)) sp_apply_theme_yield(view, overlay);
+    if (overlay) {
+        // 单向重申（只让位不恢复，防抖动）；桌面语境自证武装后声明态胶囊也算数。
+        sp_arm_grace_if_desktop(view, overlay);
+        if (sp_theme_capsules_effective(overlay) ||
+            (sp_cc_grace_active() && sp_theme_capsules_declared(overlay)))
+            sp_apply_theme_yield(view, overlay);
+    } else if (gThemeSeenRecent() && objc_getAssociatedObject(view, &spSbYieldedKey)) {
+        // overlay 暂不可得：宽限内持续记忆让位（补后到的子视图）；宽限过期恢复原生。
+        if (sp_cc_grace_active()) sp_grace_recall_yield(view);
+        else sp_restore_theme_yield(view);
+    }
 }
 
 static void (*sp_orig_didMove_ui)(id, SEL) = NULL;
@@ -364,12 +519,21 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
     UIView *overlay = sp_theme_overlay_for(view);
     BOOL capsOn = sp_theme_capsules_effective(overlay);
 
-    // 显示路径（alpha>=0.01）：主屏且主题在场 → 胶囊有效则重申让位，否则恢复
-    // （进出 App/控制中心时 Lunora 会藏 overlay，原生条要完整）。
+    // 显示路径（alpha>=0.01）：主屏且主题在场 → 让位；CC 窗口条可见记兜底信号；
+    // 宽限期内 overlay 未挂回也按记忆 rect 让位（消 CC 收起闪切）。
     if (alpha >= 0.01f) {
+        if (win) {
+            NSString *wcls = NSStringFromClass([win class]);
+            if ([wcls isEqualToString:@"SBControlCenterWindow"]) {
+                gCcBarSeenAt = CACurrentMediaTime();
+            }
+        }
         if (sp_window_is_home_context(win) && overlay) {
-            if (capsOn) sp_apply_theme_yield(view, overlay);
-            else sp_restore_theme_yield(view);
+            sp_arm_grace_if_desktop(view, overlay);
+            sp_apply_theme_yield(view, overlay);
+        } else if (sp_window_is_home_context(win) && !overlay &&
+                   sp_cc_grace_active() && gThemeSeenRecent()) {
+            sp_grace_recall_yield(view);
         } else {
             sp_restore_theme_yield(view);
         }
@@ -387,9 +551,31 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
 
     if (!home) {
         // 非主屏上下文（控制中心/锁屏/App）：交给系统与主题，顺手恢复让位。
+        // CC 窗口条的隐藏也是 CC 活动证据（刷新兜底信号的时间锚）。
+        if (win) {
+            NSString *wcls = NSStringFromClass([win class]);
+            if ([wcls isEqualToString:@"SBControlCenterWindow"]) {
+                gCcBarSeenAt = CACurrentMediaTime();
+            }
+        }
         sp_restore_theme_yield(view);
         orig(self, _cmd, alpha);
         return;
+    }
+
+    // 桌面语境自证武装（1.3.12）：收起时对既有实例的隐藏调用也当场开宽限。
+    sp_arm_grace_if_desktop(view, overlay);
+
+    // CC 收起兜底信号（1.3.10）：四回调钩万一没装上/签名漂移时，用「CC 窗口条
+    // 最近走过显示路径 + 主屏出现隐藏调用 + 主题最近在场」推断 CC 刚收起，照样开宽限。
+    double nowCc = CACurrentMediaTime();
+    if (home && nowCc - gCcBarSeenAt < 3.0 && gThemeSeenRecent() && gCcGraceUntil < nowCc) {
+        gCcGraceUntil = nowCc + kCcGraceSeconds;
+        if (gCcDiagLogBudget > 0) {
+            gCcDiagLogBudget--;
+            sp_log(@"cc grace: fallback arm (cc bar %.1fs ago, caller=%s)",
+                   nowCc - gCcBarSeenAt, fromSolo ? "solo" : "other");
+        }
     }
 
     if (overlay) {
@@ -406,8 +592,7 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
                    NSStringFromClass([overlay class]), capsOn ? 1 : 0);
         }
         orig(self, _cmd, 1.0f);
-        if (capsOn) sp_apply_theme_yield(view, overlay);
-        else sp_restore_theme_yield(view);
+        sp_apply_theme_yield(view, overlay);
         return;
     }
 
@@ -423,6 +608,17 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
                    win ? NSStringFromClass([win class]) : @"(nil)");
         }
         orig(self, _cmd, 1.0f);
+        if (sp_cc_grace_active() && gThemeSeenRecent()) sp_grace_recall_yield(view);
+        return;
+    }
+
+    if (sp_cc_grace_active() && gThemeSeenRecent()) {
+        // CC 收起窗口期 overlay 尚未挂回：主题插件的压制调用先拦住，记忆 rect 让位，
+        // 避免"放行隐藏 → Solo 再拉回"的整条抖动。
+        if (!gKeptViews) gKeptViews = [NSHashTable weakObjectsHashTable];
+        [gKeptViews addObject:view];
+        orig(self, _cmd, 1.0f);
+        sp_grace_recall_yield(view);
         return;
     }
 
@@ -480,9 +676,137 @@ static void sp_schedule_ownership_reprobe(void) {
     if (t) CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
 }
 
+// ---- CC 收起事件（1.3.9）：与 Lunora 同款钩 SBControlCenterController 四回调 ----
+// 进入（_willPresent/_willBeginTransition）：先转发后清宽限；退出（_didEndTransition/
+// _didDismiss）：先转发后开宽限。两插件在同一选择器上各挂一层互不影响（都会被调），
+// 这是从 alpha 风暴里猜"CC 收起了没"拿不到的确定性信号。
+static void (*sp_orig_cc_present)(id, SEL) = NULL;
+static void (*sp_orig_cc_begin_transition)(id, SEL) = NULL;
+static void (*sp_orig_cc_end_transition)(id, SEL) = NULL;
+static void (*sp_orig_cc_dismiss)(id, SEL) = NULL;
+
+static void sp_cc_will_present(id self, SEL _cmd) {
+    if (sp_orig_cc_present) sp_orig_cc_present(self, _cmd);
+    gCcGraceUntil = 0.0; // CC 打开：退出宽限（宽限只服务收起）
+}
+static void sp_cc_will_begin_transition(id self, SEL _cmd) {
+    if (sp_orig_cc_begin_transition) sp_orig_cc_begin_transition(self, _cmd);
+    // 转场开始（打开/收起都可能）：先武装宽限。打开方向随后 _willPresent 会清；
+    // 收起方向必须在这里就有宽限——收起转场中途系统就重建桌面条实例，等到
+    // _didEndTransition/_didDismiss 才武装就晚了一个转场（1.3.10 实测闪切根因）。
+    gCcGraceUntil = CACurrentMediaTime() + kCcGraceSeconds;
+}
+static void sp_cc_did_end_transition(id self, SEL _cmd) {
+    if (sp_orig_cc_end_transition) sp_orig_cc_end_transition(self, _cmd);
+    gCcGraceUntil = CACurrentMediaTime() + kCcGraceSeconds;
+    if (gCcGraceLogBudget > 0) {
+        gCcGraceLogBudget--;
+        sp_log(@"cc grace: start %.1fs (didEndTransition)", kCcGraceSeconds);
+    }
+}
+static void sp_cc_did_dismiss(id self, SEL _cmd) {
+    if (sp_orig_cc_dismiss) sp_orig_cc_dismiss(self, _cmd);
+    gCcGraceUntil = CACurrentMediaTime() + kCcGraceSeconds;
+    if (gCcGraceLogBudget > 0) {
+        gCcGraceLogBudget--;
+        sp_log(@"cc grace: start %.1fs (didDismiss)", kCcGraceSeconds);
+    }
+}
+
+// 前台语境（1.3.12）：Lunora 同款钩 SpringBoard frontDisplayDidChange:。
+// 只判 nil 与非 nil（App 前台 vs 桌面/CC），不解参数类型，避开版本 ABI 漂移。
+static void (*sp_orig_front_display)(id, SEL, id) = NULL;
+
+static void sp_front_display_did_change(id self, SEL _cmd, id display) {
+    if (sp_orig_front_display) sp_orig_front_display(self, _cmd, display);
+    if (!gFrontDisplaySeen) {
+        gFrontDisplaySeen = YES;
+        if (gCcDiagLogBudget > 0) {
+            gCcDiagLogBudget--;
+            sp_log(@"cc diag: frontDisplay hook verified");
+        }
+    }
+    BOOL app = (display != nil);
+    if (app != gAppForeground) {
+        gAppForeground = app;
+        if (app) gCcGraceUntil = 0.0; // 进 App：立即退出让位语境，状态栏完整
+        if (gCcDiagLogBudget > 0) {
+            gCcDiagLogBudget--;
+            sp_log(@"cc diag: frontDisplay -> %@", app ? @"app" : @"home");
+        }
+    }
+}
+
+static BOOL sp_cc_selector_ok_arity(Class cls, NSString *name, int wantArgs) {
+    if (!cls || name.length == 0) return NO;
+    SEL sel = NSSelectorFromString(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    if (method_getNumberOfArguments(m) != wantArgs) return NO;
+    char ret[4] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    return ret[0] == 'v';
+}
+
+// ABI 守卫：实例方法存在、2 参（self+_cmd）、返回 void——仿 Lunora 对同一批回调的
+// 校验；系统签名漂移时宁可不安钩（漂移只会退回 1.3.6 行为，不会崩溃）。
+static BOOL sp_cc_selector_ok(Class cls, NSString *name) {
+    if (!cls || name.length == 0) return NO;
+    SEL sel = NSSelectorFromString(name);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    if (method_getNumberOfArguments(m) != 2) return NO;
+    char ret[4] = {0};
+    method_getReturnType(m, ret, sizeof(ret));
+    return ret[0] == 'v';
+}
+
+static BOOL gCcHooksInstalled = NO;
+
+static void sp_install_cc_hooks(void) {
+    if (gCcHooksInstalled) return;
+    int n = 0;
+    Class cc = objc_getClass("SBControlCenterController");
+    if (cc) {
+        if (sp_cc_selector_ok(cc, @"_didDismiss")) {
+            MSHookMessageEx(cc, NSSelectorFromString(@"_didDismiss"),
+                            (IMP)sp_cc_did_dismiss, (IMP *)&sp_orig_cc_dismiss);
+            n++;
+        }
+        if (sp_cc_selector_ok(cc, @"_didEndTransition")) {
+            MSHookMessageEx(cc, NSSelectorFromString(@"_didEndTransition"),
+                            (IMP)sp_cc_did_end_transition, (IMP *)&sp_orig_cc_end_transition);
+            n++;
+        }
+        if (sp_cc_selector_ok(cc, @"_willPresent")) {
+            MSHookMessageEx(cc, NSSelectorFromString(@"_willPresent"),
+                            (IMP)sp_cc_will_present, (IMP *)&sp_orig_cc_present);
+            n++;
+        }
+        if (sp_cc_selector_ok(cc, @"_willBeginTransition")) {
+            MSHookMessageEx(cc, NSSelectorFromString(@"_willBeginTransition"),
+                            (IMP)sp_cc_will_begin_transition, (IMP *)&sp_orig_cc_begin_transition);
+            n++;
+        }
+    }
+    // 前台语境钩独立安装（CC 类缺失也不影响自证武装）。
+    int front = 0;
+    Class sb = objc_getClass("SpringBoard");
+    if (sb && sp_cc_selector_ok_arity(sb, @"frontDisplayDidChange:", 3)) {
+        MSHookMessageEx(sb, NSSelectorFromString(@"frontDisplayDidChange:"),
+                        (IMP)sp_front_display_did_change, (IMP *)&sp_orig_front_display);
+        front = 1;
+    }
+    if (n > 0 || front) {
+        gCcHooksInstalled = YES;
+        sp_log(@"cc hooks: cc=%d frontDisplay=%d", n, front);
+    }
+}
+
 static BOOL gStatusHooksInstalled = NO;
 
 static void sp_install_status_hooks(void) {
+    sp_install_cc_hooks();
     if (gStatusHooksInstalled) return;
     SEL sel = @selector(setAlpha:);
     SEL dmw = @selector(didMoveToWindow);
