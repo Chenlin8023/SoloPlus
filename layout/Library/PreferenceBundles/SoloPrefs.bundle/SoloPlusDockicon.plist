@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>Dockicon 图标上限</string>
+			<key>footerText</key>
+			<string>上限改为 6 后建议注销。6 个图标需要手动把第 6 个应用拖进 Dock。 防呆：切回 5 后请注销；注销后约 3 秒会自动把 Dock 最后一个图标迁回主屏，迁移失败则保持 6，不会强踢。Dock 内放文件夹时不建议同时开 6 图标。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSegmentCell</string>
+			<key>label</key>
+			<string>图标上限</string>
+			<key>key</key>
+			<string>soloPlusDockMaxIcons</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<real>5.0</real>
+			<key>validTitles</key>
+			<array>
+				<string>5 个</string>
+				<string>6 个</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<real>5.0</real>
+				<real>6.0</real>
+			</array>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>六图标适配</string>
+			<key>footerText</key>
+			<string>仅在图标上限=6 且 Dock 实际有 6 个图标时生效。竖排空间不够时先减小图标，或保持自动下移。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSegmentCell</string>
+			<key>label</key>
+			<string>图标大小</string>
+			<key>key</key>
+			<string>soloPlusDockIconScale</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<real>1.0</real>
+			<key>validTitles</key>
+			<array>
+				<string>小</string>
+				<string>较小</string>
+				<string>略小</string>
+				<string>默认</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<real>0.85</real>
+				<real>0.9</real>
+				<real>0.95</real>
+				<real>1.0</real>
+			</array>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>自动下移</string>
+			<key>key</key>
+			<string>soloPlusDockAutoShift</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+	</array>
+</dict>
+</plist>

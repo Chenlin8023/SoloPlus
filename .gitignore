@@ -1,0 +1,23 @@
+# Build output
+packages/
+.theos/
+*.deb
+*.dylib
+*.o
+*.dSYM/
+build/
+
+# Original Solo package and any local vendor binaries — never commit
+vendor/
+dev-archive/
+SoloPlus-dev-archive/
+
+# Local logs / editor / OS
+*.log
+*.ips
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+__pycache__/
+*.pyc

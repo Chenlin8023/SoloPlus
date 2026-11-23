@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a Solo+ issue with device and log details
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Solo+ is an unofficial enhancement layer for **Solo 1.0.1**.
+        Please include the exact `[Solo+]` log lines; reports without logs are hard to diagnose.
+  - type: input
+    id: device
+    attributes:
+      label: Device / iOS
+      placeholder: iPhone 15 Pro, iOS 17.2.1, RootHide
+    validations:
+      required: true
+  - type: input
+    id: solo
+    attributes:
+      label: Solo version
+      placeholder: 1.0.1
+    validations:
+      required: true
+  - type: input
+    id: atria
+    attributes:
+      label: Atria version (if installed)
+      placeholder: 1.4.1-11
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what actually happened.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant [Solo+] logs
+      description: Paste lines containing dock / carousel fill / auto-evict / panel load.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I am using Solo 1.0.1
+          required: true
+        - label: I installed the companion package (not only the local merged package)
+        - label: I respringed after installing

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>items</key>
+	<array>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
+			<string>轮播挂件</string>
+			<key>footerText</key>
+			<string>让小组件内容铺满轮播背景（原版会缩到 280.6pt 并留边）。铺满可能裁切小组件边缘；修改后回到桌面生效。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>铺满轮播</string>
+			<key>key</key>
+			<string>soloPlusCarouselFill</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+	</array>
+</dict>
+</plist>
