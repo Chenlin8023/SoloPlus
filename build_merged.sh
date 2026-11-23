@@ -1,9 +1,15 @@
 #!/bin/bash
-# 把 Solo 原包 + 当前 SoloPlus 增强包合并成“一个包”：
+# 把 Solo 原包 + 当前 SoloPlus 增强包合并成“一个包”。
+#
+# 默认（本地测试口径）：
 #   - 包 id 保持 com.oakstheawesome.solo（升级链不断）
 #   - 版本 = 1.0.1+sp<companion 版本>
-#   - 内含 Solo 原文件 + SoloPlus.dylib + SoloPrefs.bundle/SoloPlus.plist
+#   - 内含 Solo 原文件 + SoloPlus.dylib + SoloPrefs.bundle/SoloPlus*.plist
 #   - 与独立的 com.chenlin8023.soloplus 冲突（安装前需卸载它，避免双注入）
+#
+# 发布口径由 build_release.sh 用环境变量覆盖：PKG_ID / PKG_NAME / PKG_VERSION /
+# PKG_MAINTAINER / PKG_AUTHOR / PKG_DEPENDS / PKG_CONFLICTS / PKG_REPLACES /
+# PKG_DESCRIPTION / OUT_DEB。空字符串 = 删除该字段。
 set -u
 
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -18,6 +24,19 @@ COMPANION=$(ls -1t "$SRC"/packages/com.chenlin8023.soloplus_*.deb 2>/dev/null | 
 COMP_VER=$(dpkg-deb -f "$COMPANION" Version)
 [ -n "$COMP_VER" ] || die "读不到 companion 版本"
 
+PKG_ID="${PKG_ID:-com.oakstheawesome.solo}"
+PKG_NAME="${PKG_NAME:-Solo+（增强）}"
+PKG_VERSION="${PKG_VERSION:-1.0.1+sp$COMP_VER}"
+PKG_MAINTAINER="${PKG_MAINTAINER:-OaksTheAwesome}"
+PKG_AUTHOR="${PKG_AUTHOR:-OaksTheAwesome}"
+PKG_DEPENDS="${PKG_DEPENDS:-mobilesubstrate (>= 0.9.5000), preferenceloader}"
+PKG_CONFLICTS="${PKG_CONFLICTS-com.chenlin8023.soloplus}"
+PKG_REPLACES="${PKG_REPLACES-com.chenlin8023.soloplus}"
+PKG_DESCRIPTION="${PKG_DESCRIPTION:-An iPhone Duo inspired UI tweak
+Solo+ 已集成：设置 → Solo → 增强（状态栏 / Duo / 轮播铺满 / Dockicon）。
+本地增强层，非上游官方；卸载本包会一并移除 Solo。}"
+OUT_DEB="${OUT_DEB:-Solo_1.0.1+sp${COMP_VER}_iphoneos-arm64.deb}"
+
 rm -rf "$DST"; mkdir -p "$DST"
 dpkg-deb -R "$ORIG" "$DST/merged" || die "解包 Solo 原包失败"
 dpkg-deb -x "$COMPANION" "$DST/comp" || die "解包 companion 失败"
@@ -31,70 +50,44 @@ cp "$DST/comp/var/jb/Library/MobileSubstrate/DynamicLibraries/SoloPlus.dylib" "$
 cp "$DST/comp/var/jb/Library/MobileSubstrate/DynamicLibraries/SoloPlus.plist" "$DL/" || die "缺少 SoloPlus.plist"
 cp "$DST/comp/var/jb/Library/PreferenceBundles/SoloPrefs.bundle/"SoloPlus*.plist "$PB/" || die "缺少面板 SoloPlus*.plist"
 
-echo "=== 合并 control（Solo 原 control + Solo+ 说明）==="
-python3 - "$DST/merged/DEBIAN/control" "1.0.1+sp$COMP_VER" <<'PY'
-import sys, re, io
-path, newver = sys.argv[1], sys.argv[2]
-raw = open(path, encoding='utf-8').read()
-lines = raw.splitlines()
-out = []
-desc_done = False
-for ln in lines:
-    if ln.startswith('Version:'):
-        out.append('Version: ' + newver); continue
-    if ln.startswith('Name:'):
-        out.append('Name: Solo+（增强）'); continue
-    if ln.startswith('Conflicts:'):
-        continue
-    if ln.startswith('Replaces:'):
-        continue
-    out.append(ln)
-    if ln.startswith('Description:'):
-        out.append(' Solo+ 已集成：设置 → Solo → 状态栏（保留系统状态栏开关）。')
-        out.append(' 本地增强包，非上游官方；卸载本包会一并移除 Solo。')
-        out.append(' Conflicts 独立补丁包 com.chenlin8023.soloplus。')
-        desc_done = True
-# insert Conflicts/Replaces after Depends block
-final = []
-for ln in out:
-    final.append(ln)
-    if ln.startswith('Depends:') and not any(x.startswith('Conflicts:') for x in final):
-        final.append('Conflicts: com.chenlin8023.soloplus')
-        final.append('Replaces: com.chenlin8023.soloplus')
-if not any(x.startswith('Conflicts:') for x in final):
-    final.append('Conflicts: com.chenlin8023.soloplus')
-    final.append('Replaces: com.chenlin8023.soloplus')
-open(path, 'w', encoding='utf-8').write('\n'.join(final) + '\n')
-print('\n'.join(final[:16]))
-PY
-
-# Installed-Size 重算
+echo "=== 合并 control ==="
 SIZE=$(du -sk "$DST/merged" | awk '{print $1}')
-python3 - "$DST/merged/DEBIAN/control" "$SIZE" <<'PY'
-import sys
-p, size = sys.argv[1], sys.argv[2]
-lines = open(p, encoding='utf-8').read().splitlines()
-out = []
-done = False
-for ln in lines:
-    if ln.startswith('Installed-Size:'):
-        out.append('Installed-Size: ' + size); done = True
-    else:
-        out.append(ln)
-if not done:
-    out.append('Installed-Size: ' + size)
-open(p, 'w', encoding='utf-8').write('\n'.join(out) + '\n')
+export PKG_ID PKG_NAME PKG_VERSION PKG_MAINTAINER PKG_AUTHOR PKG_DEPENDS \
+       PKG_CONFLICTS PKG_REPLACES PKG_DESCRIPTION SIZE
+python3 - "$DST/control-spec.json" <<'PY'
+import json, os, sys
+env = os.environ
+spec = {
+    "Package": env["PKG_ID"],
+    "Name": env["PKG_NAME"],
+    "Version": env["PKG_VERSION"],
+    "Maintainer": env["PKG_MAINTAINER"],
+    "Author": env["PKG_AUTHOR"],
+    "Depends": env["PKG_DEPENDS"],
+    "Conflicts": env.get("PKG_CONFLICTS", ""),
+    "Replaces": env.get("PKG_REPLACES", ""),
+    "Installed-Size": env["SIZE"],
+    "Description": env["PKG_DESCRIPTION"],
+}
+with open(sys.argv[1], "w", encoding="utf-8") as fp:
+    json.dump(spec, fp, ensure_ascii=False, indent=2)
+    fp.write("\n")
 PY
+python3 "$SRC/tools/rewrite_control.py" "$DST/merged/DEBIAN/control" "$DST/control-spec.json" \
+    || die "control 重写失败"
 
-chmod 755 "$DL/SoloPlus.dylib"
-chmod 644 "$DL/SoloPlus.plist" "$PB/"SoloPlus*.plist
+chmod 755 "$DL/SoloPlus.dylib" "$DL/Solo.dylib" "$PB/SoloPrefs"
+chmod 644 "$DL/SoloPlus.plist" "$DL/Solo.plist" "$PB/"SoloPlus*.plist
 find "$DST/merged/var/jb" -type d -exec chmod 755 {} +
 find "$DST/merged/var/jb" -type f -name "*.dylib" -exec chmod 755 {} +
 
-OUT="$SRC/packages/Solo_1.0.1+sp${COMP_VER}_iphoneos-arm64.deb"
+echo "=== 合并产物终审（arm64e PAC 断言）==="
+python3 "$SRC/tools/verify_fixups.py" "$DL/SoloPlus.dylib" || die "合并包 arm64e 终审断言失败"
+
+OUT="$SRC/packages/$OUT_DEB"
 rm -f "$OUT"
 dpkg-deb --root-owner-group -b -Zxz "$DST/merged" "$OUT" >/dev/null || die "合并打包失败"
 echo "=== 完成: $OUT ==="
-dpkg-deb -I "$OUT" | sed -n '1,18p'
+dpkg-deb -I "$OUT" | sed -n '1,20p'
 echo "--- 关键文件 ---"
-dpkg-deb -c "$OUT" | grep -E "SoloPlus|SoloPrefs.bundle/(Root|SoloPlus)" || true
+dpkg-deb -c "$OUT" | grep -E "SoloPlus|/Solo\.dylib|SoloPrefs.bundle/(Root|SoloPlus|SoloPrefs$)" || true

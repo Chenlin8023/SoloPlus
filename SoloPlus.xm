@@ -24,6 +24,10 @@ static NSString *const kSoloLogPath = @"/var/jb/var/mobile/Library/Preferences/S
 static BOOL gKeepStatusBar = YES;
 static BOOL gDebug = NO;
 static BOOL gShowDuo = YES;
+static BOOL gShowDuoTime = YES;
+static BOOL gShowDuoBattery = YES;
+static double gDuoBatteryOffset = 0.0;
+static BOOL gHideDuoIcons = YES;
 static double gDataFontScale = 1.0;
 static double gDataFontWeight = 0.0; // 0=跟随 1=细 2=常规 3=中粗 4=粗
 static double gDockMaxIcons = 5.0;
@@ -31,8 +35,17 @@ static double gDockIconScale = 1.0;
 static BOOL gDockAutoShift = YES;
 static BOOL gCarouselFill = YES;
 
+static __weak UIView *gDuoAnchorView = nil;   // Duo 容器（106x88 小挂件）
+static __weak UIView *gDuoBatteryHost = nil;
+static UILabel *gDuoBatteryLabel = nil;
+static char spDuoTimeTextKey = 0;             // 被我们清空/隐藏的 Duo 时间原文
+
 static pthread_mutex_t gLogLock = PTHREAD_MUTEX_INITIALIZER;
-static int gBlockedLogBudget = 3;
+static int gBlockedLogBudget = 8;
+static int gUnmatchedStatusLogBudget = 8;
+static int gForcedLogBudget = 8;
+static int gSbDumpBudget = 2;   // 一次性状态栏层级 dump 预算（诊断用）
+static NSHashTable *gKeptViews = nil; // 被 Solo 隐藏又被我们拦回的视图（weak）
 
 static void sp_log(NSString *fmt, ...) {
     if (!gDebug) return;
@@ -85,6 +98,12 @@ static void sp_load_prefs(void) {
     gKeepStatusBar = sp_read_bool(kKeepStatusBarKey, YES);
     gDebug = sp_read_bool(kDebugKey, NO) || sp_read_bool(@"debugLogging", NO);
     gShowDuo = sp_read_bool(kShowDuoKey, YES);
+    gShowDuoTime = sp_read_bool(@"soloPlusShowDuoTime", YES);
+    gShowDuoBattery = sp_read_bool(@"soloPlusShowDuoBattery", YES);
+    gDuoBatteryOffset = sp_read_double(@"soloPlusDuoBatteryOffset", 0.0);
+    if (gDuoBatteryOffset < -16.0) gDuoBatteryOffset = -16.0;
+    if (gDuoBatteryOffset > 24.0) gDuoBatteryOffset = 24.0;
+    gHideDuoIcons = sp_read_bool(@"soloPlusHideDuoIcons", YES);
     gDataFontScale = sp_read_double(kDataFontScaleKey, 1.0);
     if (gDataFontScale < 0.6) gDataFontScale = 0.6;
     if (gDataFontScale > 1.8) gDataFontScale = 1.8;
@@ -112,7 +131,13 @@ static BOOL sp_caller_is_solo(void *ret) {
 static BOOL sp_window_is_home_context(UIWindow *window) {
     if (!window) return NO;
     NSString *cls = NSStringFromClass([window class]);
-    return [cls isEqualToString:@"SBStatusBarWindow"] || [cls isEqualToString:@"SBHomeScreenWindow"];
+    // iOS 16.5 实测：主屏可见状态栏前景视图在 UIStatusBarWindow；锁屏/切换器
+    // 还会出现 SBMainSwitcherWindow。17.2 上是 SBStatusBarWindow/SBHomeScreenWindow。
+    // 注意：SBStatusBarReusePoolWindow 是 App 状态栏复用池，故意不加入。
+    return [cls isEqualToString:@"SBStatusBarWindow"]
+        || [cls isEqualToString:@"SBHomeScreenWindow"]
+        || [cls isEqualToString:@"SBMainSwitcherWindow"]
+        || [cls isEqualToString:@"UIStatusBarWindow"];
 }
 
 static BOOL sp_is_statusbar_foreground(UIView *view) {
@@ -124,7 +149,18 @@ static BOOL sp_is_statusbar_foreground(UIView *view) {
 static void sp_force_show_view(UIView *view) {
     if (!view) return;
     if (sp_is_statusbar_foreground(view)) {
-        if (view.alpha < 0.01f) view.alpha = 1.0f;
+        // 只恢复我们拦过的视图（gKeptViews）。绝不无差别 alpha=1：
+        // 美化插件自己藏掉的原生状态栏不能被我们拉出来。
+        if (gKeptViews && [gKeptViews containsObject:view] && view.alpha < 0.01f) {
+            view.alpha = 1.0f;
+            if (gForcedLogBudget > 0) {
+                gForcedLogBudget--;
+                sp_log(@"force show kept view: view=%@ superview=%@ win=%@",
+                       NSStringFromClass([view class]),
+                       NSStringFromClass([view.superview class]),
+                       view.window ? NSStringFromClass([view.window class]) : @"(nil)");
+            }
+        }
         return; // 只处理状态栏前景视图，绝不改动其它 alpha=0 的 UI（例如被 Solo 隐藏的 Dock 背景）
     }
     for (UIView *sub in view.subviews) sp_force_show_view(sub);
@@ -140,32 +176,308 @@ static void sp_force_show_all(void) {
     }
 }
 
+// 诊断：递归打印状态栏子树（类名/指针/frame/alpha/hidden/z 序），限行数防刷屏。
+static void sp_sb_dump_node(UIView *v, int depth, int *remaining) {
+    if (!v || *remaining <= 0 || depth > 6) return;
+    (*remaining)--;
+    NSUInteger z = v.superview ? [v.superview.subviews indexOfObjectIdenticalTo:v] : 0;
+    sp_log(@"sbdump d%d %@ %p frame=%@ alpha=%.2f hidden=%d z=%lu",
+           depth, NSStringFromClass([v class]), (__bridge void *)v,
+           NSStringFromCGRect(v.frame), (double)v.alpha, v.isHidden ? 1 : 0,
+           (unsigned long)z);
+    for (UIView *sub in v.subviews) sp_sb_dump_node(sub, depth + 1, remaining);
+}
+
+// 首次遇到“非 Solo 的压制”时调用：dump 该前景视图的 superview 子树 + 窗口子视图列表，
+// 用于确定左右簇结构与美化条视图的位置/z 序。
+static void sp_sb_dump_around(UIView *view) {
+    if (gSbDumpBudget <= 0) return;
+    gSbDumpBudget--;
+    UIView *container = view.superview;
+    UIWindow *win = view.window;
+    sp_log(@"sbdump begin view=%p container=%@ win=%@",
+           (__bridge void *)view,
+           container ? NSStringFromClass([container class]) : @"(nil)",
+           win ? NSStringFromClass([win class]) : @"(nil)");
+    int remaining = 60;
+    if (container) sp_sb_dump_node(container, 0, &remaining);
+    if (win && remaining > 0) {
+        for (UIView *sub in win.subviews) {
+            if (remaining <= 0) break;
+            remaining--;
+            NSUInteger z = [win.subviews indexOfObjectIdenticalTo:sub];
+            sp_log(@"sbdump win-child %@ %p frame=%@ alpha=%.2f hidden=%d z=%lu",
+                   NSStringFromClass([sub class]), (__bridge void *)sub,
+                   NSStringFromCGRect(sub.frame), (double)sub.alpha,
+                   sub.isHidden ? 1 : 0, (unsigned long)z);
+        }
+    }
+    sp_log(@"sbdump end (lines left %d)", remaining);
+}
+
 static void (*sp_orig_setAlpha_ui)(id, SEL, CGFloat) = NULL;
 static void (*sp_orig_setAlpha_st)(id, SEL, CGFloat) = NULL;
 
-static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
-                                void (*orig)(id, SEL, CGFloat)) {
-    if (!orig) return;
-    if (gKeepStatusBar && alpha < 0.01f) {
-        UIView *view = (UIView *)self;
-        UIWindow *win = view.window;
-        if (sp_window_is_home_context(win)) {
-            if (gBlockedLogBudget > 0) {
-                gBlockedLogBudget--;
-                sp_log(@"blocked statusbar hide in %@", NSStringFromClass([win class]));
-            }
-            orig(self, _cmd, 1.0f);
-            return;
+// ---- 主题状态栏共存（Lunora / LNV2 等）----
+// Lunora 的结构（17.2 实测 dump）：STUIStatusBar 里 z0=LNV2OverlayView（玻璃胶囊，
+// frame 即"美化区域声明"），z1=原生 STUIStatusBarForegroundView。它靠把原生前景视图
+// alpha→0 露出胶囊，连带没启用胶囊的区域（左侧）也被藏掉。
+// 共存规则（1.3.6）：覆盖层"存在"即算主题在场（Lunora 转场时会瞬时 hidden 自己的
+// overlay 却继续压制原生条，可见性不能作判据）；整条保活交给 Solo，胶囊"有效可见"
+// 时才让位，覆盖层藏掉期间整条原生条都听 Solo。
+static char spSbYieldedKey = 0;      // 前景视图上记录被让位的子视图
+static int gYieldLogBudget = 12;
+
+// 前景视图同层里"非系统前缀"的覆盖层（LNV2OverlayView 等）。不看 hidden/alpha：
+// Lunora 会瞬时藏 overlay 但压制不停，存在性才是稳定判据。
+// 16.5 加固：跳过 MT（系统材质）等前缀，且覆盖层须横贯状态栏（≥60% 宽）——
+// 防止旧 _UIStatusBar 里的系统辅助视图被误判成美化覆盖层。
+static UIView *sp_theme_overlay_for(UIView *fgview) {
+    UIView *parent = fgview.superview;
+    if (!parent) return nil;
+    CGFloat minW = fgview.frame.size.width * 0.6f;
+    for (UIView *sib in parent.subviews) {
+        if (sib == fgview) continue;
+        NSString *cls = NSStringFromClass([sib class]);
+        if ([cls hasPrefix:@"STUI"] || [cls hasPrefix:@"_UI"] ||
+            [cls hasPrefix:@"UI"] || [cls hasPrefix:@"MT"]) continue;
+        if (sib.frame.size.width > 1.0f && sib.frame.size.width >= minW) return sib;
+    }
+    return nil;
+}
+
+// 覆盖层此刻是否真的在显示胶囊：overlay 自身可见 + 至少一个可见、有实际 frame 的胶囊。
+static BOOL sp_theme_capsules_effective(UIView *overlay) {
+    if (!overlay || overlay.hidden || overlay.alpha < 0.01f) return NO;
+    for (UIView *cap in overlay.subviews)
+        if (!cap.hidden && cap.frame.size.width > 1.0f && cap.frame.size.height > 1.0f) return YES;
+    return NO;
+}
+
+// 把与可见胶囊重叠的原生内容子视图 alpha 压 0，并记录到关联对象。
+// 胶囊当前"无效可见"（overlay 被藏）时不让位并恢复，避免右/左侧双空。
+static void sp_restore_theme_yield(UIView *fgview); // 前向声明（下方定义）
+
+static void sp_apply_theme_yield(UIView *fgview, UIView *overlay) {
+    if (!sp_theme_capsules_effective(overlay)) {
+        sp_restore_theme_yield(fgview);
+        return;
+    }
+    NSMutableArray *caps = [NSMutableArray array];
+    for (UIView *cap in overlay.subviews) {
+        if (cap.hidden || cap.frame.size.width < 1.0f || cap.frame.size.height < 1.0f) continue;
+        [caps addObject:[NSValue valueWithCGRect:[fgview convertRect:cap.frame fromView:overlay]]];
+    }
+    if (caps.count == 0) return;
+    NSMutableArray *yielded = objc_getAssociatedObject(fgview, &spSbYieldedKey)
+                              ?: [NSMutableArray array];
+    BOOL changed = NO;
+    for (UIView *sub in fgview.subviews) {
+        if (sub.hidden || sub.alpha < 0.01f) continue;
+        BOOL hit = NO;
+        for (NSValue *v in caps)
+            if (CGRectIntersectsRect(sub.frame, [v CGRectValue])) { hit = YES; break; }
+        if (!hit) continue;
+        sub.alpha = 0.0f;
+        [yielded addObject:sub];
+        changed = YES;
+        if (gYieldLogBudget > 0) {
+            gYieldLogBudget--;
+            sp_log(@"sb yield: %@ %@ -> alpha0 (theme=%@)",
+                   NSStringFromClass([sub class]), NSStringFromCGRect(sub.frame),
+                   NSStringFromClass([overlay class]));
         }
     }
+    if (changed || yielded.count)
+        objc_setAssociatedObject(fgview, &spSbYieldedKey, yielded,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// 覆盖层不可见 / 离开主屏：恢复被让位的子视图（App 内状态栏要完整）。
+static void sp_restore_theme_yield(UIView *fgview) {
+    NSMutableArray *yielded = objc_getAssociatedObject(fgview, &spSbYieldedKey);
+    if (!yielded.count) return;
+    NSUInteger n = 0;
+    for (UIView *sub in yielded)
+        if (!sub.hidden && sub.alpha < 0.01f) { sub.alpha = 1.0f; n++; }
+    objc_setAssociatedObject(fgview, &spSbYieldedKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (gYieldLogBudget > 0) {
+        gYieldLogBudget--;
+        sp_log(@"sb yield restore: %lu subview(s) on %@",
+               (unsigned long)n, NSStringFromClass([fgview class]));
+    }
+}
+
+// ---- 挂载/布局时机同步（修 CC→主屏的识别闪切）----
+// CC 关闭回主屏时系统会新建前景视图实例（默认整条可见），Lunora 的压制稍后才到，
+// 中间窗口期就是"原生右列 ↔ 胶囊"的闪切。在 didMoveToWindow 就同步让位状态，
+// layoutSubviews 单向重申（只让位不恢复，避免 overlay 瞬藏窗口期引起内容抖动）。
+static void sp_sb_sync_on_attach(UIView *view) {
+    if (!gKeepStatusBar) return;
+    UIWindow *win = view.window;
+    if (!win || !sp_window_is_home_context(win)) {
+        sp_restore_theme_yield(view);
+        return;
+    }
+    UIView *overlay = sp_theme_overlay_for(view);
+    if (overlay && sp_theme_capsules_effective(overlay)) sp_apply_theme_yield(view, overlay);
+    else sp_restore_theme_yield(view);
+}
+
+static void sp_sb_assert_on_layout(UIView *view) {
+    if (!gKeepStatusBar) return;
+    UIWindow *win = view.window;
+    if (!win || !sp_window_is_home_context(win)) return;
+    UIView *overlay = sp_theme_overlay_for(view);
+    if (overlay && sp_theme_capsules_effective(overlay)) sp_apply_theme_yield(view, overlay);
+}
+
+static void (*sp_orig_didMove_ui)(id, SEL) = NULL;
+static void (*sp_orig_didMove_st)(id, SEL) = NULL;
+static void (*sp_orig_layout_ui)(id, SEL) = NULL;
+static void (*sp_orig_layout_st)(id, SEL) = NULL;
+
+static void sp_fg_didMove_ui(id self, SEL _cmd) {
+    if (sp_orig_didMove_ui) sp_orig_didMove_ui(self, _cmd);
+    sp_sb_sync_on_attach((UIView *)self);
+}
+static void sp_fg_didMove_st(id self, SEL _cmd) {
+    if (sp_orig_didMove_st) sp_orig_didMove_st(self, _cmd);
+    sp_sb_sync_on_attach((UIView *)self);
+}
+static void sp_fg_layout_ui(id self, SEL _cmd) {
+    if (sp_orig_layout_ui) sp_orig_layout_ui(self, _cmd);
+    sp_sb_assert_on_layout((UIView *)self);
+}
+static void sp_fg_layout_st(id self, SEL _cmd) {
+    if (sp_orig_layout_st) sp_orig_layout_st(self, _cmd);
+    sp_sb_assert_on_layout((UIView *)self);
+}
+
+static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
+                                void (*orig)(id, SEL, CGFloat), void *caller) {
+    if (!orig) return;
+    UIView *view = (UIView *)self;
+    UIWindow *win = view.window;
+
+    // 主题覆盖层"存在"即算接管候选（不看可见性），胶囊"有效可见"才让位。
+    UIView *overlay = sp_theme_overlay_for(view);
+    BOOL capsOn = sp_theme_capsules_effective(overlay);
+
+    // 显示路径（alpha>=0.01）：主屏且主题在场 → 胶囊有效则重申让位，否则恢复
+    // （进出 App/控制中心时 Lunora 会藏 overlay，原生条要完整）。
+    if (alpha >= 0.01f) {
+        if (sp_window_is_home_context(win) && overlay) {
+            if (capsOn) sp_apply_theme_yield(view, overlay);
+            else sp_restore_theme_yield(view);
+        } else {
+            sp_restore_theme_yield(view);
+        }
+        orig(self, _cmd, alpha);
+        return;
+    }
+
+    if (!gKeepStatusBar) {
+        orig(self, _cmd, alpha);
+        return;
+    }
+
+    BOOL fromSolo = sp_caller_is_solo(caller);
+    BOOL home = sp_window_is_home_context(win);
+
+    if (!home) {
+        // 非主屏上下文（控制中心/锁屏/App）：交给系统与主题，顺手恢复让位。
+        sp_restore_theme_yield(view);
+        orig(self, _cmd, alpha);
+        return;
+    }
+
+    if (overlay) {
+        // 主题接管中：整条保活。胶囊有效 → 让位（未美化区域可见、美化区域让位）；
+        // 胶囊无效（overlay 被藏）→ 恢复让位，整条都听 Solo。
+        if (!gKeptViews) gKeptViews = [NSHashTable weakObjectsHashTable];
+        [gKeptViews addObject:view];
+        if (gBlockedLogBudget > 0) {
+            gBlockedLogBudget--;
+            sp_log(@"blocked statusbar hide: view=%@ %p win=%@ caller=%s theme=%@ caps=%d",
+                   NSStringFromClass([view class]), (__bridge void *)view,
+                   win ? NSStringFromClass([win class]) : @"(nil)",
+                   fromSolo ? "solo" : "other",
+                   NSStringFromClass([overlay class]), capsOn ? 1 : 0);
+        }
+        orig(self, _cmd, 1.0f);
+        if (capsOn) sp_apply_theme_yield(view, overlay);
+        else sp_restore_theme_yield(view);
+        return;
+    }
+
+    if (fromSolo) {
+        // 无主题覆盖：整条保活（iOS 16.5 / 无美化 17.2 的既有行为）。
+        if (!gKeptViews) gKeptViews = [NSHashTable weakObjectsHashTable];
+        [gKeptViews addObject:view];
+        if (gBlockedLogBudget > 0) {
+            gBlockedLogBudget--;
+            sp_log(@"blocked statusbar hide: view=%@ %p superview=%@ win=%@ caller=solo",
+                   NSStringFromClass([view class]), (__bridge void *)view,
+                   NSStringFromClass([view.superview class]),
+                   win ? NSStringFromClass([win class]) : @"(nil)");
+        }
+        orig(self, _cmd, 1.0f);
+        return;
+    }
+
+    // caller=other 且主屏无主题覆盖：放行（系统自身行为），留痕 + 首次 dump。
+    if (gUnmatchedStatusLogBudget > 0) {
+        gUnmatchedStatusLogBudget--;
+        sp_log(@"ignored statusbar hide: view=%@ %p superview=%@ win=%@ caller=other",
+               NSStringFromClass([view class]), (__bridge void *)view,
+               NSStringFromClass([view.superview class]),
+               win ? NSStringFromClass([win class]) : @"(nil)");
+    }
+    sp_sb_dump_around(view);
     orig(self, _cmd, alpha);
 }
 
 static void sp_setAlpha_ui(id self, SEL _cmd, CGFloat alpha) {
-    sp_common_set_alpha(self, _cmd, alpha, sp_orig_setAlpha_ui);
+    sp_common_set_alpha(self, _cmd, alpha, sp_orig_setAlpha_ui, __builtin_return_address(0));
 }
 static void sp_setAlpha_st(id self, SEL _cmd, CGFloat alpha) {
-    sp_common_set_alpha(self, _cmd, alpha, sp_orig_setAlpha_st);
+    sp_common_set_alpha(self, _cmd, alpha, sp_orig_setAlpha_st, __builtin_return_address(0));
+}
+
+// 诊断：检查两个类的 setAlpha: 顶层 IMP 是否仍是我们的钩子。若美化插件同样
+// hook 且排在我们上面，caller 归因会全部变成 other（蹦床效应）。
+static void sp_probe_status_hook_ownership(void) {
+    SEL sel = @selector(setAlpha:);
+    Class ui = objc_getClass("_UIStatusBarForegroundView");
+    Class st = objc_getClass("STUIStatusBarForegroundView");
+    if (ui) {
+        Method m = class_getInstanceMethod(ui, sel);
+        IMP imp = m ? method_getImplementation(m) : NULL;
+        sp_log(@"sbhook ownership: _UIStatusBarForegroundView top=%s",
+               (imp == (IMP)sp_setAlpha_ui) ? "ours" : "other");
+    }
+    if (st) {
+        Method m = class_getInstanceMethod(st, sel);
+        IMP imp = m ? method_getImplementation(m) : NULL;
+        sp_log(@"sbhook ownership: STUIStatusBarForegroundView top=%s",
+               (imp == (IMP)sp_setAlpha_st) ? "ours" : "other");
+    }
+}
+
+static void sp_ownership_reprobe_cb(CFRunLoopTimerRef timer, void *info) {
+    sp_probe_status_hook_ownership();
+    CFRunLoopTimerInvalidate(timer);
+    CFRunLoopRemoveTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+    CFRelease(timer);
+}
+
+static void sp_schedule_ownership_reprobe(void) {
+    CFRunLoopTimerContext ctx = {0, NULL, NULL, NULL, NULL};
+    CFRunLoopTimerRef t = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                                               CFAbsoluteTimeGetCurrent() + 5.0,
+                                               0, 0, 0, sp_ownership_reprobe_cb, &ctx);
+    if (t) CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
 }
 
 static BOOL gStatusHooksInstalled = NO;
@@ -173,13 +485,29 @@ static BOOL gStatusHooksInstalled = NO;
 static void sp_install_status_hooks(void) {
     if (gStatusHooksInstalled) return;
     SEL sel = @selector(setAlpha:);
+    SEL dmw = @selector(didMoveToWindow);
+    SEL lay = @selector(layoutSubviews);
     Class ui = objc_getClass("_UIStatusBarForegroundView");
     Class st = objc_getClass("STUIStatusBarForegroundView");
     BOOL any = NO;
-    if (ui) { MSHookMessageEx(ui, sel, (IMP)sp_setAlpha_ui, (IMP *)&sp_orig_setAlpha_ui); any = YES; }
-    if (st) { MSHookMessageEx(st, sel, (IMP)sp_setAlpha_st, (IMP *)&sp_orig_setAlpha_st); any = YES; }
+    if (ui) {
+        MSHookMessageEx(ui, sel, (IMP)sp_setAlpha_ui, (IMP *)&sp_orig_setAlpha_ui);
+        MSHookMessageEx(ui, dmw, (IMP)sp_fg_didMove_ui, (IMP *)&sp_orig_didMove_ui);
+        MSHookMessageEx(ui, lay, (IMP)sp_fg_layout_ui, (IMP *)&sp_orig_layout_ui);
+        any = YES;
+    }
+    if (st) {
+        MSHookMessageEx(st, sel, (IMP)sp_setAlpha_st, (IMP *)&sp_orig_setAlpha_st);
+        MSHookMessageEx(st, dmw, (IMP)sp_fg_didMove_st, (IMP *)&sp_orig_didMove_st);
+        MSHookMessageEx(st, lay, (IMP)sp_fg_layout_st, (IMP *)&sp_orig_layout_st);
+        any = YES;
+    }
     gStatusHooksInstalled = any;
-    if (any) sp_log(@"statusbar hooks installed");
+    if (any) {
+        sp_log(@"statusbar hooks installed");
+        sp_probe_status_hook_ownership();
+        sp_schedule_ownership_reprobe();
+    }
 }
 
 static void sp_status_retry_cb(CFRunLoopTimerRef timer, void *info) {
@@ -1273,6 +1601,11 @@ static void sp_apply_duo_visibility(void) {
     if (v) v.hidden = !gShowDuo;
 }
 
+static void sp_locate_duo_anchor(void);
+static void sp_apply_duo_time_visibility(void);
+static void sp_apply_duo_battery(void);
+static void sp_apply_duo_icons(void);
+
 static void sp_apply_data_label_live(void) {
     UILabel *lab = gDataLabel;
     if (lab) {
@@ -1288,7 +1621,18 @@ static void sp_apply_data_label_live(void) {
 
 static int gDataLogBudget = 4;
 
+static BOOL sp_text_is_clock_time(NSString *t);
+
 static void sp_label_setText(id self, SEL _cmd, NSString *text) {
+    // Duo 时间：在 setter 里把文字直接换空串，Solo 的玻璃/快照层也就抓不到时间了。
+    if (!gShowDuoTime && text.length > 0 && gDuoAnchorView
+        && [(UIView *)self isDescendantOfView:(UIView *)gDuoAnchorView]
+        && sp_text_is_clock_time(text)) {
+        objc_setAssociatedObject(self, &spDuoTimeTextKey, text,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (sp_orig_label_setText) sp_orig_label_setText(self, _cmd, @"");
+        return;
+    }
     void *ret = __builtin_return_address(0);
     BOOL marked = sp_is_marked_data_label(self);
     BOOL fromSolo = sp_caller_is_solo(ret);
@@ -1323,6 +1667,17 @@ static void sp_label_setText(id self, SEL _cmd, NSString *text) {
 }
 
 static void sp_label_setAttributedText(id self, SEL _cmd, NSAttributedString *attr) {
+    if (!gShowDuoTime && attr.length > 0 && gDuoAnchorView
+        && [(UIView *)self isDescendantOfView:(UIView *)gDuoAnchorView]
+        && sp_text_is_clock_time(attr.string)) {
+        objc_setAssociatedObject(self, &spDuoTimeTextKey, attr.string,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (sp_orig_label_setAttributedText) {
+            sp_orig_label_setAttributedText(self, _cmd,
+                [[NSAttributedString alloc] initWithString:@""]);
+        }
+        return;
+    }
     void *ret = __builtin_return_address(0);
     NSString *str = attr.string;
     BOOL marked = sp_is_marked_data_label(self);
@@ -1414,6 +1769,10 @@ static void sp_scan_data_labels(void) {
         }
     }
     sp_apply_duo_visibility();
+    sp_locate_duo_anchor();
+    sp_apply_duo_time_visibility();
+    sp_apply_duo_battery();
+    sp_apply_duo_icons();
 }
 
 static void sp_data_scan_cb(CFRunLoopTimerRef timer, void *info) {
@@ -1426,6 +1785,424 @@ static void sp_schedule_data_scan(void) {
                                                CFAbsoluteTimeGetCurrent() + 1.5,
                                                1.0, 0, 0, sp_data_scan_cb, &ctx);
     if (t) CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+}
+
+#pragma mark - Duo 时间开关 / 下方电量
+
+// Duo 是 Solo 主屏的状态环：上方一行时间（时钟文字），环内是数据读数。
+// 这里只做两件事：① 单独开关上方时间（状态栏已有时间）；② 环下方显示剩余电量。
+
+static int gBatteryPct = -1;
+static void sp_dump_view_level(UIView *v, int depth, int maxDepth);
+static void sp_dump_layer_level(CALayer *l, int depth, int maxDepth);
+static BOOL gBatteryCharging = NO;
+static NSTimeInterval gBatteryReadAt = 0;
+static int gDuoTimeLogBudget = 4;
+static int gDuoBatteryLogBudget = 6;
+static int gDuoIconLogBudget = 6;
+static int gDuoDumpBudget = 1;
+static int gDuoRowDumpBudget = 1;
+static int gDuoHideRevision = 0;
+static BOOL gClockHooksInstalled = NO;
+
+static BOOL sp_class_has_prefix(id obj, NSString *prefix) {
+    NSString *cls = NSStringFromClass([obj class]);
+    return cls && [cls hasPrefix:prefix];
+}
+
+// 9:41 / 09:41 / 9:41 AM / 9:41:05 都算时间；"18°"、"5G"、"11月23日" 不算。
+static BOOL sp_text_is_clock_time(NSString *t) {
+    if (![t isKindOfClass:[NSString class]]) return NO;
+    if (t.length < 3 || t.length > 10) return NO;
+    NSUInteger digits = 0, colons = 0;
+    for (NSUInteger i = 0; i < t.length; i++) {
+        unichar c = [t characterAtIndex:i];
+        if (c >= '0' && c <= '9') { digits++; continue; }
+        if (c == ':' || c == 0xFF1A) { colons++; continue; }
+        if (c == ' ' || c == 'A' || c == 'P' || c == 'M'
+            || c == 'a' || c == 'p' || c == 'm') continue;
+        return NO;
+    }
+    return (colons == 1 || colons == 2) && digits >= 3 && digits <= 6;
+}
+
+static BOOL sp_view_inside_status_bar(UIView *v) {
+    UIView *cur = v;
+    for (int i = 0; i < 4 && cur; i++) {
+        NSString *cls = NSStringFromClass([cur class]);
+        if ([cls containsString:@"StatusBar"] || [cls containsString:@"STUI"]) return YES;
+        cur = cur.superview;
+    }
+    return NO;
+}
+
+// 圆环整行：从读数容器往上找“宽度至少半屏、高度不是整页”的最大容器。
+// 实测读数小栈只有 106x88，直接拿它当圆环会把电量塞进环内。
+static UIView *sp_duo_anchor_view(UIView *from) {
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    UIView *best = nil;
+    CGFloat bestArea = 0;
+    UIView *cur = from;
+    for (int i = 0; i < 8 && cur; i++) {
+        CGSize s = cur.bounds.size;
+        BOOL fullPage = (s.height >= screen.height * 0.6);
+        if (!fullPage && s.width >= screen.width * 0.5 && s.height >= 60) {
+            CGFloat area = s.width * s.height;
+            if (area > bestArea) { bestArea = area; best = cur; }
+        }
+        cur = cur.superview;
+    }
+    return best;
+}
+
+static void sp_locate_duo_anchor(void) {
+    UIView *from = gDataContainer ? (UIView *)gDataContainer : (UIView *)gDataLabel;
+    if (!from) return;
+    UIView *anchor = sp_duo_anchor_view(from);
+    if (!anchor) anchor = (UIView *)gDataContainer;
+    if (!anchor || anchor == gDuoAnchorView) return;
+    gDuoAnchorView = anchor;
+    if (gDuoBatteryLogBudget > 0) {
+        gDuoBatteryLogBudget--;
+        sp_log(@"duo anchor %@ %.0fx%.0f win=%@", NSStringFromClass([anchor class]),
+               anchor.bounds.size.width, anchor.bounds.size.height,
+               anchor.window ? NSStringFromClass([anchor.window class]) : @"(nil)");
+    }
+    // 换容器（Solo 重建/上浮）时立刻补一次隐藏，别等下一个 1s tick。
+    if (!gShowDuoTime) sp_apply_duo_time_visibility();
+    if (gHideDuoIcons) sp_apply_duo_icons();
+}
+
+// IOKit.ps 兜底（SpringBoard 里 UIDevice.batteryLevel 可能返回 -1）；不新增链接依赖。
+typedef CFTypeRef (*spIOPSInfoFn)(void);
+typedef CFArrayRef (*spIOPSListFn)(CFTypeRef);
+typedef CFDictionaryRef (*spIOPSDescFn)(CFTypeRef, CFTypeRef);
+
+static void sp_read_battery_level(void) {
+    gBatteryPct = -1;
+    gBatteryCharging = NO;
+    UIDevice *dev = [UIDevice currentDevice];
+    if (!dev.batteryMonitoringEnabled) dev.batteryMonitoringEnabled = YES;
+    float lvl = dev.batteryLevel;
+    if (lvl >= 0.0f) {
+        gBatteryPct = (int)lroundf(lvl * 100.0f);
+        UIDeviceBatteryState st = dev.batteryState;
+        gBatteryCharging = (st == UIDeviceBatteryStateCharging
+                            || st == UIDeviceBatteryStateFull);
+    }
+    if (gBatteryPct < 0) {
+        static spIOPSInfoFn infoFn = NULL;
+        static spIOPSListFn listFn = NULL;
+        static spIOPSDescFn descFn = NULL;
+        static BOOL resolved = NO;
+        if (!resolved) {
+            resolved = YES;
+            void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY);
+            if (h) {
+                infoFn = (spIOPSInfoFn)dlsym(h, "IOPSCopyPowerSourcesInfo");
+                listFn = (spIOPSListFn)dlsym(h, "IOPSCopyPowerSourcesList");
+                descFn = (spIOPSDescFn)dlsym(h, "IOPSGetPowerSourceDescription");
+            }
+            if (!infoFn || !listFn || !descFn) {
+                sp_log(@"battery: IOKit.ps unavailable");
+            }
+        }
+        if (infoFn && listFn && descFn) {
+            CFTypeRef blob = infoFn();
+            if (blob) {
+                CFArrayRef list = listFn(blob);
+                if (list) {
+                    for (CFIndex i = 0; i < CFArrayGetCount(list); i++) {
+                        CFDictionaryRef d = descFn(blob, CFArrayGetValueAtIndex(list, i));
+                        if (!d) continue;
+                        int cap = -1, maxc = -1;
+                        CFNumberRef cRef = (CFNumberRef)CFDictionaryGetValue(
+                            d, CFSTR("Current Capacity"));
+                        CFNumberRef mRef = (CFNumberRef)CFDictionaryGetValue(
+                            d, CFSTR("Max Capacity"));
+                        if (cRef) CFNumberGetValue(cRef, kCFNumberIntType, &cap);
+                        if (mRef) CFNumberGetValue(mRef, kCFNumberIntType, &maxc);
+                        CFBooleanRef chg = (CFBooleanRef)CFDictionaryGetValue(
+                            d, CFSTR("Is Charging"));
+                        if (chg) gBatteryCharging = CFBooleanGetValue(chg);
+                        if (cap >= 0 && maxc > 0) {
+                            gBatteryPct = (int)lround(100.0 * (double)cap / (double)maxc);
+                            break;
+                        }
+                    }
+                    CFRelease(list);
+                }
+                CFRelease(blob);
+            }
+        }
+    }
+    gBatteryReadAt = CFAbsoluteTimeGetCurrent();
+}
+
+static UILabel *sp_duo_battery_label(void) {
+    if (gDuoBatteryLabel) return gDuoBatteryLabel;
+    UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+    lab.textAlignment = NSTextAlignmentCenter;
+    lab.adjustsFontSizeToFitWidth = YES;
+    lab.minimumScaleFactor = 0.75;
+    lab.userInteractionEnabled = NO;
+    lab.backgroundColor = [UIColor clearColor];
+    lab.textColor = [UIColor secondaryLabelColor];
+    gDuoBatteryLabel = lab;
+    return lab;
+}
+
+// 跟 Duo 读数同字族/字重：直接取 5G 标签的 font 缩一档，避免“粗细不一致”。
+static void sp_style_battery_label(UILabel *lab) {
+    UILabel *data = gDataLabel;
+    UIFont *base = data ? ((UIFont *(*)(id, SEL))objc_msgSend)(data, @selector(font)) : nil;
+    CGFloat size = base ? base.pointSize * 0.95 : 13.0;
+    if (size < 11.0) size = 11.0;
+    if (size > 17.0) size = 17.0;
+    UIFont *font = base ? [base fontWithSize:size]
+                        : [UIFont monospacedDigitSystemFontOfSize:size
+                                                          weight:UIFontWeightSemibold];
+    if (font && ![font isEqual:lab.font]) lab.font = font;
+}
+
+static void sp_apply_duo_battery(void) {
+    UILabel *lab = gDuoBatteryLabel;
+    if (!gShowDuo || !gShowDuoBattery) {
+        if (lab) lab.hidden = YES;
+        return;
+    }
+    lab = sp_duo_battery_label();
+    UIView *anchor = gDuoAnchorView;
+    if (!anchor || !anchor.window) {
+        lab.hidden = YES;
+        return;
+    }
+    // 轮播切到时钟页时 Duo 会上浮；借位置变化把两层结构打出来（最多 3 次），
+    // 用来抓“模糊时间复现”到底是谁画的。
+    {
+        static CGPoint lastCenter = {0, 0};
+        static int floatDumpBudget = 3;
+        CGPoint c = anchor.center;
+        if (floatDumpBudget > 0 && lastCenter.y > 0.0 && fabs(c.y - lastCenter.y) > 20.0) {
+            floatDumpBudget--;
+            sp_log(@"duo float dy=%.0f (dump)", c.y - lastCenter.y);
+            sp_dump_view_level(anchor, 0, 2);
+            sp_dump_view_level(anchor.superview, 0, 2);
+            sp_dump_layer_level(anchor.layer, 0, 2);
+            sp_apply_duo_time_visibility();
+            sp_apply_duo_icons();
+        }
+        lastCenter = c;
+    }
+    NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+    if (gBatteryPct < 0 || now - gBatteryReadAt > 10.0) sp_read_battery_level();
+    sp_style_battery_label(lab);
+
+    if (gBatteryPct < 0) {
+        lab.text = @"--";
+        lab.textColor = [UIColor secondaryLabelColor];
+    } else {
+        lab.text = [NSString stringWithFormat:@"%d%%", gBatteryPct];
+        if (gBatteryCharging) lab.textColor = [UIColor systemGreenColor];
+        else if (gBatteryPct <= 20) lab.textColor = [UIColor systemRedColor];
+        else lab.textColor = [UIColor labelColor];
+    }
+
+    // 与 Duo 容器同一层、按容器 frame 居中；宽度收到 64，避免右侧空间不足时被夹回左边。
+    UIView *host = anchor.superview ?: anchor;
+    CGRect ar = (host == anchor) ? anchor.bounds : anchor.frame;
+    CGFloat w = 64.0, h = 22.0;
+    CGFloat x = CGRectGetMidX(ar) - w * 0.5;
+    CGFloat y = CGRectGetMaxY(ar) + 2.0 + (CGFloat)gDuoBatteryOffset;
+    CGFloat maxY = CGRectGetMaxY(host.bounds) - h - 1.0;
+    if (y > maxY) y = MAX(1.0, maxY);
+    if (y < 1.0) y = 1.0;
+
+    if (lab.superview != host) {
+        [lab removeFromSuperview];
+        [host addSubview:lab];
+    }
+    lab.frame = CGRectMake(x, y, w, h);
+    lab.hidden = NO;
+    [host bringSubviewToFront:lab];
+
+    if (host != gDuoBatteryHost) {
+        gDuoBatteryHost = host;
+        if (gDuoBatteryLogBudget > 0) {
+            gDuoBatteryLogBudget--;
+            sp_log(@"battery host %@ anchor=%.0fx%.0f at %.0f,%.0f -> frame %.0f,%.0f off=%.0f pct=%d chg=%d",
+                   NSStringFromClass([host class]), ar.size.width, ar.size.height,
+                   ar.origin.x, ar.origin.y, x, y, gDuoBatteryOffset, gBatteryPct, gBatteryCharging);
+        }
+    }
+}
+
+static char spDuoTimeHiddenKey = 0;
+static char spDuoIconHiddenKey = 0;
+
+static void sp_dump_view_level(UIView *v, int depth, int maxDepth) {
+    if (!v || depth > maxDepth) return;
+    NSMutableString *line = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [line appendString:@"  "];
+    NSString *extra = @"";
+    if ([v isKindOfClass:[UILabel class]]) {
+        NSString *t = ((UILabel *)v).text;
+        if (t.length) extra = [NSString stringWithFormat:@" text=%@", t];
+    }
+    [line appendFormat:@"%@ %.0fx%.0f @%.0f,%.0f%@", NSStringFromClass([v class]),
+        v.frame.size.width, v.frame.size.height, v.frame.origin.x, v.frame.origin.y, extra];
+    sp_log(@"  %@", line);
+    if (depth == maxDepth) return;
+    NSUInteger n = 0;
+    for (UIView *sub in v.subviews) {
+        if (n++ >= 12) {
+            sp_log(@"  (… %lu more)", (unsigned long)(v.subviews.count - 12));
+            break;
+        }
+        sp_dump_view_level(sub, depth + 1, maxDepth);
+    }
+}
+
+static void sp_dump_layer_level(CALayer *l, int depth, int maxDepth) {
+    if (!l || depth > maxDepth) return;
+    NSMutableString *line = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [line appendString:@"  "];
+    [line appendFormat:@"layer %@ %@ %.0fx%.0f", NSStringFromClass([l class]),
+        l.name ?: @"", l.bounds.size.width, l.bounds.size.height];
+    sp_log(@"  %@", line);
+    for (CALayer *sub in l.sublayers) sp_dump_layer_level(sub, depth + 1, maxDepth);
+}
+
+// Solo 的玻璃背板会缓存一层模糊快照；改完文字后让它重新布局，避免旧快照里带着时间。
+static void sp_refresh_duo_glass(UIView *root) {
+    if (!root) return;
+    for (UIView *sub in root.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        if ([cls hasPrefix:@"UnduoGlass"] || [cls containsString:@"Backdrop"]
+            || [cls containsString:@"Blur"]) {
+            [sub setNeedsLayout];
+            [sub layoutIfNeeded];
+        }
+        sp_refresh_duo_glass(sub);
+    }
+}
+
+// 只认 Duo 容器内部的时间文字（实测是容器顶部 106x22 的普通 UILabel）。
+// 不去动 UnduoClockMirroredLabel：那是轮播时钟页的字，关了会把大时钟一起干掉。
+static void sp_walk_duo_time(UIView *v, BOOL hide, UIView *anchor) {
+    for (UIView *sub in v.subviews) {
+        if (!hide && objc_getAssociatedObject(sub, &spDuoTimeHiddenKey)) {
+            sub.hidden = NO;
+            sub.alpha = 1.0;
+            objc_setAssociatedObject(sub, &spDuoTimeHiddenKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        if (!hide && [sub isKindOfClass:[UILabel class]]) {
+            NSString *stored = objc_getAssociatedObject(sub, &spDuoTimeTextKey);
+            if (stored) {
+                ((void (*)(id, SEL, id))objc_msgSend)(sub, @selector(setText:), stored);
+                objc_setAssociatedObject(sub, &spDuoTimeTextKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        if (hide && [sub isKindOfClass:[UILabel class]]) {
+            UILabel *lab = (UILabel *)sub;
+            BOOL marked = objc_getAssociatedObject(lab, &spDuoTimeHiddenKey) != nil;
+            BOOL inAnchor = (anchor != nil && [sub isDescendantOfView:anchor]);
+            BOOL match = (marked || (inAnchor && sp_text_is_clock_time(lab.text)));
+            if (match) {
+                NSString *curText = lab.text;
+                lab.hidden = YES;
+                lab.alpha = 0.0;
+                if (!marked) {
+                    objc_setAssociatedObject(lab, &spDuoTimeHiddenKey, @YES,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    // 已存在的标签也把文字清掉：快照/玻璃层抓不到时间
+                    if (curText.length > 0) {
+                        objc_setAssociatedObject(lab, &spDuoTimeTextKey, curText,
+                                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                        if (sp_orig_label_setText) {
+                            sp_orig_label_setText(lab, @selector(setText:), @"");
+                        }
+                    }
+                    if (gDuoTimeLogBudget > 0) {
+                        gDuoTimeLogBudget--;
+                        sp_log(@"duo time hide %@ text=%@ %.0fx%.0f",
+                               NSStringFromClass([lab class]), curText,
+                               lab.frame.size.width, lab.frame.size.height);
+                    }
+                    gDuoHideRevision++;
+                }
+            }
+        }
+        sp_walk_duo_time(sub, hide, anchor);
+    }
+}
+
+static void sp_apply_duo_time_visibility(void) {
+    BOOL hide = !gShowDuoTime;
+    UIView *anchor = gDuoAnchorView;
+    @autoreleasepool {
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            NSString *wc = NSStringFromClass([w class]);
+            if (![wc containsString:@"HomeScreen"]) continue;
+            sp_walk_duo_time(w, hide, anchor);
+        }
+    }
+    // 有新标签被清空时，让玻璃背板重排一次，别留旧快照里的模糊时间。
+    static int seenRevision = 0;
+    if (hide && anchor && gDuoHideRevision != seenRevision) {
+        seenRevision = gDuoHideRevision;
+        sp_refresh_duo_glass(anchor.superview ?: anchor);
+    }
+}
+
+// Duo 下方的小图标（定位箭头/装饰点等）：只认锚定容器内、读数下方、44pt 以内的图片类视图。
+static void sp_walk_duo_icons(UIView *v, BOOL hide, CGRect dataWin) {
+    for (UIView *sub in v.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        BOOL imageish = [sub isKindOfClass:[UIImageView class]]
+            || [cls containsString:@"Image"] || [cls containsString:@"Icon"];
+        if (imageish) {
+            if (hide) {
+                CGRect r = [sub convertRect:sub.bounds toView:nil];
+                BOOL below = CGRectIsNull(dataWin)
+                    || (CGRectGetMinY(r) >= CGRectGetMaxY(dataWin) - 8.0);
+                BOOL small = (r.size.width <= 44.0 && r.size.height <= 44.0);
+                if (below && small) {
+                    sub.hidden = YES;
+                    sub.alpha = 0.0;
+                    objc_setAssociatedObject(sub, &spDuoIconHiddenKey, @YES,
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    if (gDuoIconLogBudget > 0) {
+                        gDuoIconLogBudget--;
+                        sp_log(@"duo icon hide %@ %.0fx%.0f at %.0f,%.0f",
+                               cls, r.size.width, r.size.height, r.origin.x, r.origin.y);
+                    }
+                }
+            } else if (objc_getAssociatedObject(sub, &spDuoIconHiddenKey)) {
+                sub.hidden = NO;
+                sub.alpha = 1.0;
+                objc_setAssociatedObject(sub, &spDuoIconHiddenKey, nil,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+        sp_walk_duo_icons(sub, hide, dataWin);
+    }
+}
+
+static void sp_apply_duo_icons(void) {
+    UIView *anchor = gDuoAnchorView;
+    if (!anchor) return;
+    if (gDuoRowDumpBudget > 0) {
+        gDuoRowDumpBudget--;
+        sp_log(@"duo row dump %@:", NSStringFromClass([anchor class]));
+        sp_dump_view_level(anchor, 0, 2);
+    }
+    CGRect dataWin = CGRectNull;
+    UILabel *data = gDataLabel;
+    if (data && data.window) dataWin = [data convertRect:data.bounds toView:nil];
+    sp_walk_duo_icons(anchor, gHideDuoIcons, dataWin);
 }
 
 #pragma mark - Solo 面板注入（Settings 进程）
@@ -1523,11 +2300,22 @@ static void sp_notify_cb(CFNotificationCenterRef center, void *observer,
                          CFStringRef name, const void *object, CFDictionaryRef userInfo) {
     (void)center; (void)observer; (void)name; (void)object; (void)userInfo;
     sp_load_prefs();
+    {
+        static int reloadBudget = 3;
+        if (reloadBudget > 0) {
+            reloadBudget--;
+            sp_log(@"prefs reload: duo=%d", gShowDuo);
+        }
+    }
     sp_refresh_carousel();
     if (gKeepStatusBar) sp_force_show_all();
     sp_apply_data_label_live();
     sp_reapply_dock_icon_scale();
     sp_apply_duo_visibility();
+    sp_locate_duo_anchor();
+    sp_apply_duo_time_visibility();
+    sp_apply_duo_battery();
+    sp_apply_duo_icons();
     sp_scan_data_labels();
 }
 
@@ -1550,9 +2338,11 @@ static void sp_register_notifications(void) {
             createDirectoryAtPath:@"/var/jb/var/mobile/Library/Preferences/Solo/Logs"
             withIntermediateDirectories:YES attributes:nil error:nil];
         sp_load_prefs();
-        sp_log(@"loaded (keep=%d duo=%d dataScale=%.2f weight=%.0f)",
-               gKeepStatusBar, gShowDuo, gDataFontScale, gDataFontWeight);
-            sp_install_status_hooks();
+        sp_log(@"loaded (keep=%d duo=%d time=%d batt=%d dataScale=%.2f weight=%.0f)",
+               gKeepStatusBar, gShowDuo, gShowDuoTime, gShowDuoBattery,
+               gDataFontScale, gDataFontWeight);
+        sp_log(@"duo extras: batteryOffset=%.0f hideIcons=%d", gDuoBatteryOffset, gHideDuoIcons);
+        sp_install_status_hooks();
         sp_install_dock_hooks();
         sp_install_data_hook();
         sp_install_carousel_hooks();

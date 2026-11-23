@@ -30,6 +30,86 @@
 			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
+			<string>Duo 细节</string>
+			<key>footerText</key>
+			<string>时间开关只作用于 Solo 时钟文字（UnduoClockMirroredLabel）；电量挂在 Duo 整行下方、与读数同字族字重；下方图标开关用于去掉定位箭头等非电量符号。位置不合适时用「电量上下微调」推一档。</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>显示 Duo 时间</string>
+			<key>key</key>
+			<string>soloPlusShowDuoTime</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Duo 下方电量</string>
+			<key>key</key>
+			<string>soloPlusShowDuoBattery</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>隐藏 Duo 下方图标</string>
+			<key>key</key>
+			<string>soloPlusHideDuoIcons</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<true/>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSegmentCell</string>
+			<key>label</key>
+			<string>电量上下微调</string>
+			<key>key</key>
+			<string>soloPlusDuoBatteryOffset</string>
+			<key>defaults</key>
+			<string>com.oakstheawesome.solo</string>
+			<key>default</key>
+			<real>0</real>
+			<key>validTitles</key>
+			<array>
+				<string>-8</string>
+				<string>-4</string>
+				<string>0</string>
+				<string>+4</string>
+				<string>+8</string>
+			</array>
+			<key>validValues</key>
+			<array>
+				<real>-8</real>
+				<real>-4</real>
+				<real>0</real>
+				<real>4</real>
+				<real>8</real>
+			</array>
+			<key>PostNotification</key>
+			<string>com.chenlin8023.soloplus/reload</string>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSGroupCell</string>
+			<key>label</key>
 			<string>数据标识</string>
 			<key>footerText</key>
 			<string>只调整 Duo 状态读数里的数据标识（5G/LTE/3G/E/Wi-Fi）；5G 固定显示为 5G 加小号同基线 A，其余保持不变。</string>
