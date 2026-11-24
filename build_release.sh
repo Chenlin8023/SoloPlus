@@ -26,9 +26,10 @@ export PKG_REPLACES="com.oakstheawesome.solo, com.chenlin8023.soloplus"
 export OUT_DEB="com.chenlin8023.solo.full_${VERSION}_iphoneos-arm64.deb"
 export PKG_DESCRIPTION='Solo 1.0.1 与 Solo+ 增强层合并的完整单包（安装即用）。
 增强：系统状态栏保留 / Duo 独立开关与时间开关 / 5G 小号 A /
-Duo 圆环下方电量 / 桌面歌词悬浮窗 / Dockicon 6 图标与内容缩放 / 轮播铺满；入口在 Solo 面板「增强」。
+Duo 圆环下方电量 / Dock 图标上限 5-8 / 轮播铺满；入口在 Solo 面板「增强」。
+Dock 图标大小、间距与上下位置请配合第三方插件（如 Atria）调节。
 基于 Solo 1.0.1（OaksTheAwesome）；增强层 MIT，见项目仓库。
-已知限制：Dock 重排偶有卡顿；Dock 内文件夹不建议同时开 6 图标；
+已知限制：Dock 内文件夹不建议同时开 6+ 图标；
 轮播铺满可能裁切小组件边缘。'
 
 echo "=== 1/2 构建伴随包（clang19 + arm64e PAC 补丁/断言）==="

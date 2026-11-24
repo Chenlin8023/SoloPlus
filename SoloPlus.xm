@@ -6,12 +6,14 @@
 #import <Foundation/Foundation.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <substrate.h>
 #import <dlfcn.h>
 #import <fcntl.h>
 #import <unistd.h>
 #import <pthread.h>
 #include <math.h>
+#include <stdint.h>
 
 static NSString *const kSoloDomain = @"com.oakstheawesome.solo";
 static NSString *const kKeepStatusBarKey = @"soloPlusKeepStatusBar";
@@ -31,8 +33,6 @@ static BOOL gHideDuoIcons = YES;
 static double gDataFontScale = 1.0;
 static double gDataFontWeight = 0.0; // 0=跟随 1=细 2=常规 3=中粗 4=粗
 static double gDockMaxIcons = 5.0;
-static double gDockIconScale = 1.0;
-static BOOL gDockAutoShift = YES;
 static BOOL gCarouselFill = YES;
 
 static __weak UIView *gDuoAnchorView = nil;   // Duo 容器（106x88 小挂件）
@@ -43,8 +43,10 @@ static char spDuoTimeTextKey = 0;             // 被我们清空/隐藏的 Duo �
 static pthread_mutex_t gLogLock = PTHREAD_MUTEX_INITIALIZER;
 static int gBlockedLogBudget = 8;
 static int gUnmatchedStatusLogBudget = 8;
+static int gLockGuardLogBudget = 24; // 锁屏护栏/还原（1.3.21 扩容）：深会话 8 条会被烧光导致日志失明
+static int gSbDumpLaterBudget = 8;  // 锁屏栏终态取证：0.6s+2.5s 双点，每轮 2 个
 static int gForcedLogBudget = 8;
-static int gSbDumpBudget = 2;   // 一次性状态栏层级 dump 预算（诊断用）
+static int gSbDumpBudget = 6;   // 一次性状态栏层级 dump 预算（诊断用，1.3.21 扩容防深会话失明）
 static NSHashTable *gKeptViews = nil; // 被 Solo 隐藏又被我们拦回的视图（weak）
 
 static void sp_log(NSString *fmt, ...) {
@@ -110,11 +112,7 @@ static void sp_load_prefs(void) {
     gDataFontWeight = sp_read_double(kDataFontWeightKey, 0.0);
     gDockMaxIcons = sp_read_double(@"soloPlusDockMaxIcons", 5.0);
     if (gDockMaxIcons < 5.0) gDockMaxIcons = 5.0;
-    if (gDockMaxIcons > 7.0) gDockMaxIcons = 7.0;
-    gDockIconScale = sp_read_double(@"soloPlusDockIconScale", 1.0);
-    if (gDockIconScale < 0.7) gDockIconScale = 0.7;
-    if (gDockIconScale > 1.0) gDockIconScale = 1.0;
-    gDockAutoShift = sp_read_bool(@"soloPlusDockAutoShift", YES);
+    if (gDockMaxIcons > 8.0) gDockMaxIcons = 8.0;
     gCarouselFill = sp_read_bool(@"soloPlusCarouselFill", YES);
 }
 
@@ -124,6 +122,20 @@ static BOOL sp_caller_is_solo(void *ret) {
     Dl_info info;
     if (!dladdr(ret, &info) || !info.dli_fname) return NO;
     return strstr(info.dli_fname, "Solo.dylib") != NULL;
+}
+
+// 与 Solo 评估器同源的锁态读取（SBLockScreenManager isUILocked）。故意同源：
+// 日志里才能对照"评估器以为的锁态"与"护栏看到的锁态"是否一致（调试报告(23)
+// 行159/167 已实证 UI locked 与 device lock state 两层语义会错位）。
+// 私有类无头文件，选择器全部走 objc_msgSend 直调。
+static BOOL sp_device_ui_locked(void) {
+    Class cls = objc_getClass("SBLockScreenManager");
+    if (!cls) return NO;
+    SEL shared = NSSelectorFromString(@"sharedInstance");
+    if (![cls respondsToSelector:shared]) return NO;
+    id mgr = ((id (*)(id, SEL))objc_msgSend)((id)cls, shared);
+    if (!mgr || ![(id)mgr respondsToSelector:@selector(isUILocked)]) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)((id)mgr, @selector(isUILocked)) ? YES : NO;
 }
 
 #pragma mark - 状态栏
@@ -144,6 +156,16 @@ static BOOL sp_is_statusbar_foreground(UIView *view) {
     NSString *cls = NSStringFromClass([view class]);
     return [cls isEqualToString:@"_UIStatusBarForegroundView"]
         || [cls isEqualToString:@"STUIStatusBarForegroundView"];
+}
+
+// 锁屏/切换器语境（1.3.18）：NC 下拉时露出的栏可能在 SBCoverSheetWindow，
+// 也可能在 SBMainSwitcherWindow（报告(27)：护栏保住了 CoverSheet 实例，
+// 用户肉眼仍见右列消失——可见栏疑似切换器实例）。两处一律纳入护栏。
+static BOOL sp_window_is_lock_context(UIWindow *window) {
+    if (!window) return NO;
+    NSString *cls = NSStringFromClass([window class]);
+    return [cls isEqualToString:@"SBCoverSheetWindow"]
+        || [cls isEqualToString:@"SBMainSwitcherWindow"];
 }
 
 static void sp_force_show_view(UIView *view) {
@@ -176,15 +198,17 @@ static void sp_force_show_all(void) {
     }
 }
 
-// 诊断：递归打印状态栏子树（类名/指针/frame/alpha/hidden/z 序），限行数防刷屏。
+// 诊断：递归打印状态栏子树（类名/指针/frame/alpha/hidden/z 序/layer 级 hidden+mask），
+// 限行数防刷屏。lh/mask（1.3.17）：layer.mask 非空 + alpha/hidden 全正常但不可见 =
+// Lunora mask 所有权压制的直接证据（view 级字段看不见 mask）。
 static void sp_sb_dump_node(UIView *v, int depth, int *remaining) {
     if (!v || *remaining <= 0 || depth > 6) return;
     (*remaining)--;
     NSUInteger z = v.superview ? [v.superview.subviews indexOfObjectIdenticalTo:v] : 0;
-    sp_log(@"sbdump d%d %@ %p frame=%@ alpha=%.2f hidden=%d z=%lu",
+    sp_log(@"sbdump d%d %@ %p frame=%@ alpha=%.2f hidden=%d z=%lu lh=%d mask=%d",
            depth, NSStringFromClass([v class]), (__bridge void *)v,
            NSStringFromCGRect(v.frame), (double)v.alpha, v.isHidden ? 1 : 0,
-           (unsigned long)z);
+           (unsigned long)z, v.layer.hidden ? 1 : 0, v.layer.mask ? 1 : 0);
     for (UIView *sub in v.subviews) sp_sb_dump_node(sub, depth + 1, remaining);
 }
 
@@ -213,6 +237,66 @@ static void sp_sb_dump_around(UIView *view) {
         }
     }
     sp_log(@"sbdump end (lines left %d)", remaining);
+}
+
+// 终态取证（1.3.17→1.3.18 双点）：attach 时刻 item 还没组装完（报告(26) L1109
+// 零尺寸空壳），"闪现后被藏"只存在于终态；报告(27) +0.6s 采样一切可见但肉眼
+// 仍见消失 → 追加 +2.5s 第二采样点（捕更晚到的压制），并加祖先链行（从栏向上
+// 到窗口逐级 alpha/hidden/lh/mask，堵"上级视图被藏"盲区）。
+// CFRunLoopTimer C 回调，零 block 字面量；每槽 weak 单持，后到覆盖先到。
+static __weak UIView *gSbDumpLaterView[2] = {nil, nil};
+static const double gSbDumpLaterDelay[2] = {0.6, 2.5};
+static void sp_sb_dump_later_cb(CFRunLoopTimerRef timer, void *info) {
+    CFRunLoopTimerInvalidate(timer);
+    CFRunLoopRemoveTimer(CFRunLoopGetMain(), timer, kCFRunLoopCommonModes);
+    CFRelease(timer);
+    NSInteger slot = (NSInteger)(intptr_t)info;
+    if (slot < 0 || slot > 1) return;
+    UIView *view = gSbDumpLaterView[slot];
+    gSbDumpLaterView[slot] = nil;
+    if (!view || gSbDumpLaterBudget <= 0) return;
+    gSbDumpLaterBudget--;
+    UIWindow *win = view.window;
+    sp_log(@"sbdump-later[%ld] begin view=%p win=%@ (end-state +%.1fs)",
+           (long)slot, (__bridge void *)view,
+           win ? NSStringFromClass([win class]) : @"(nil)", gSbDumpLaterDelay[slot]);
+    UIView *anc = view.superview;
+    int remaining = 60;
+    while (anc && remaining > 0) {
+        remaining--;
+        sp_log(@"sbdump-up %@ %p frame=%@ alpha=%.2f hidden=%d lh=%d mask=%d",
+               NSStringFromClass([anc class]), (__bridge void *)anc,
+               NSStringFromCGRect(anc.frame), (double)anc.alpha,
+               anc.isHidden ? 1 : 0, anc.layer.hidden ? 1 : 0,
+               anc.layer.mask ? 1 : 0);
+        if (anc == win) break;
+        anc = anc.superview;
+    }
+    if (view.superview) sp_sb_dump_node(view.superview, 0, &remaining);
+    if (win && remaining > 0) {
+        for (UIView *sub in win.subviews) {
+            if (remaining <= 0) break;
+            remaining--;
+            NSUInteger z = [win.subviews indexOfObjectIdenticalTo:sub];
+            sp_log(@"sbdump-later win-child %@ %p frame=%@ alpha=%.2f hidden=%d z=%lu lh=%d mask=%d",
+                   NSStringFromClass([sub class]), (__bridge void *)sub,
+                   NSStringFromCGRect(sub.frame), (double)sub.alpha,
+                   sub.isHidden ? 1 : 0, (unsigned long)z,
+                   sub.layer.hidden ? 1 : 0, sub.layer.mask ? 1 : 0);
+        }
+    }
+    sp_log(@"sbdump-later[%ld] end (lines left %d)", (long)slot, remaining);
+}
+static void sp_sb_schedule_dump_later(UIView *view) {
+    if (gSbDumpLaterBudget <= 0) return; // 单点回调内各自再查预算，允许半轮取证
+    for (int i = 0; i < 2; i++) {
+        gSbDumpLaterView[i] = view;
+        CFRunLoopTimerContext ctx = {0, (void *)(intptr_t)i, NULL, NULL, NULL};
+        CFRunLoopTimerRef t = CFRunLoopTimerCreate(kCFAllocatorDefault,
+                                                   CFAbsoluteTimeGetCurrent() + gSbDumpLaterDelay[i],
+                                                   0, 0, 0, sp_sb_dump_later_cb, &ctx);
+        if (t) CFRunLoopAddTimer(CFRunLoopGetMain(), t, kCFRunLoopCommonModes);
+    }
 }
 
 static void (*sp_orig_setAlpha_ui)(id, SEL, CGFloat) = NULL;
@@ -277,6 +361,9 @@ static double gCcBarSeenAt = -1e9;         // 最近一次 CC 窗口条走显示
 static double gThemeSeenAt = -1e9;
 static CGRect gLastCapsRects[8];
 static int gLastCapsCount = 0;
+// 左胶囊在场标记（1.3.21）：最近一次主屏让位时 Lunora 左半区（x<195）胶囊有效。
+// 锁屏语境左列归属的判定依据——用户优先级模型 Lunora > 电话助手 > 原生：
+// 左胶囊启用时，锁屏左列随 Lunora（压制原生左列），不随还原回到原生。
 
 static BOOL gThemeSeenRecent(void) {
     return CACurrentMediaTime() - gThemeSeenAt < 10.0;
@@ -355,6 +442,14 @@ static BOOL sp_grace_recall_yield(UIView *fgview) {
 }
 
 static void sp_apply_theme_yield(UIView *fgview, UIView *overlay) {
+    // 锁定期间不让位（1.3.19），且只收回右半区（1.3.21）：左簇保持让位态。
+    if (sp_device_ui_locked()) {
+        NSMutableArray *yielded = objc_getAssociatedObject(fgview, &spSbYieldedKey);
+        for (UIView *sub in yielded) {
+            if (sub.frame.origin.x >= 195.0f && sub.alpha < 0.01f) sub.alpha = 1.0f;
+        }
+        return;
+    }
     BOOL effective = sp_theme_capsules_effective(overlay);
     BOOL graceDeclared = NO;
     if (!effective) {
@@ -435,13 +530,118 @@ static void sp_restore_theme_yield(UIView *fgview) {
     }
 }
 
+// 锁屏还原语境判定（1.3.19）：CoverSheet 恒为还原语境；MainSwitcher/StatusBarWindow
+// 仅在 UI 锁定时算（解锁状态下它们承载主屏/切换器样式，还原会砸掉 Lunora 胶囊态）。
+static BOOL sp_should_restore_lock_bar(UIWindow *win) {
+    if (!win) return NO;
+    NSString *cls = NSStringFromClass([win class]);
+    if ([cls isEqualToString:@"SBCoverSheetWindow"]) return YES;
+    if ([cls isEqualToString:@"SBMainSwitcherWindow"]
+        || [cls isEqualToString:@"SBStatusBarWindow"]) {
+        return sp_device_ui_locked() ? YES : NO;
+    }
+    return NO;
+}
+
+// 左胶囊"锁屏可见"活检测（1.3.25）：本实例 overlay 上是否存在有效左胶囊
+// （可见、有实际尺寸、落在左半区）。锁屏可见=ON 时 Lunora 会在锁屏实例的
+// overlay 上挂真 frame 胶囊；OFF 时是零尺寸隐藏壳（历次 dump 一致）。
+static BOOL sp_theme_has_left_capsule(UIView *fgview) {
+    UIView *overlay = sp_theme_overlay_for(fgview);
+    if (!overlay) return NO;
+    for (UIView *cap in overlay.subviews) {
+        if (![NSStringFromClass([cap class]) hasPrefix:@"LNV2"]) continue;
+        if (cap.hidden || cap.frame.size.width < 1.0f || cap.frame.size.height < 1.0f) continue;
+        CGRect r = [fgview convertRect:cap.frame fromView:overlay];
+        if (r.origin.x < 195.0f) return YES;
+    }
+    return NO;
+}
+
+// 左半区第三方内容视图在场检测（1.3.25）：电话助手"锁屏可见"替换态的标志。
+// 特征 = 类名首字母小写（混淆类名，如 tZBkQAHVLGPTQwXC；系统/Lunora 类均大写
+// 开头）、左半区、可见、有实际尺寸。在场 → 左列归它管，我们不还原（避免
+// 1.3.19 的叠放回归）。
+static BOOL sp_left_has_foreign_content(UIView *fgview) {
+    for (UIView *sub in fgview.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        if (cls.length == 0) continue;
+        unichar c = [cls characterAtIndex:0];
+        if ([[NSCharacterSet uppercaseLetterCharacterSet] characterIsMember:c]) continue;
+        if (sub.frame.origin.x < 195.0f && !sub.hidden && sub.alpha > 0.01f
+            && sub.frame.size.width >= 1.0f && sub.frame.size.height >= 1.0f) return YES;
+    }
+    return NO;
+}
+
+// 锁屏栏还原（1.3.25，原右簇还原扩展为左右双簇）：锁屏栏实例携带的是"锁屏前
+// 语境"的样式。右簇恒还原（x≥195：hidden/lh/alpha，1.3.19/1.3.20 语义不变）；
+// 左簇活跟随胶囊"锁屏可见"——本实例 overlay 有有效左胶囊 → 压制原生左列
+// （胶囊替换语义，优先级 Lunora 最高）；无左胶囊且无第三方内容在场 → 还原
+// 原生左列（含电话助手未替换时的默认态）；有第三方内容在场（电话助手替换态）
+// → 不碰左列。解锁回主屏后让位机制在下一次 show/layout 重新套用，自愈。
+// 不碰 LNV2*；UIVectorLabel 是合法备选渲染（嵌在 item 内部，不动）。
+static void sp_restore_lock_bar(UIView *fgview) {
+    if (!fgview) return;
+    BOOL leftCaps = sp_theme_has_left_capsule(fgview);
+    BOOL leftForeign = leftCaps ? NO : sp_left_has_foreign_content(fgview);
+    int nr = 0, nl = 0;
+    for (UIView *sub in fgview.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        if ([cls hasPrefix:@"LNV2"]) continue;
+        BOOL isRight = (sub.frame.origin.x >= 195.0f);
+        BOOL isLeft = !isRight;
+        BOOL changed = NO;
+        if ([cls hasPrefix:@"STUIStatusBar"]
+            || [cls isEqualToString:@"UIView"]
+            || [cls isEqualToString:@"_UILumaTrackingBackdropView"]) {
+            if (isRight) {
+                if (sub.hidden || sub.layer.hidden) {
+                    sub.hidden = NO;
+                    sub.layer.hidden = NO;
+                    changed = YES;
+                }
+                if (sub.alpha < 0.01f) { sub.alpha = 1.0f; changed = YES; }
+            } else if (leftCaps) {
+                // 胶囊锁屏可见：压制原生左列（胶囊替换语义）
+                if (sub.alpha > 0.01f) { sub.alpha = 0.0f; changed = YES; }
+            } else if (!leftForeign) {
+                // 无胶囊无第三方：还原原生左列
+                if (sub.hidden || sub.layer.hidden) {
+                    sub.hidden = NO;
+                    sub.layer.hidden = NO;
+                    changed = YES;
+                }
+                if (sub.alpha < 0.01f) { sub.alpha = 1.0f; changed = YES; }
+            }
+        }
+        if (changed) {
+            if (isRight) nr++; else nl++;
+        }
+    }
+    if ((nr > 0 || nl > 0) && gLockGuardLogBudget > 0) {
+        gLockGuardLogBudget--;
+        sp_log(@"lock restore: right=%d left=%d (%s) on %@",
+               nr, nl,
+               leftCaps ? "capsule" : (leftForeign ? "foreign" : "native"),
+               fgview.window ? NSStringFromClass([fgview.window class]) : @"(nil)");
+    }
+}
+
 // ---- 挂载/布局时机同步（修 CC→主屏的识别闪切）----
 // CC 关闭回主屏时系统会新建前景视图实例（默认整条可见），Lunora 的压制稍后才到，
 // 中间窗口期就是"原生右列 ↔ 胶囊"的闪切。在 didMoveToWindow 就同步让位状态，
 // layoutSubviews 单向重申（只让位不恢复，避免 overlay 瞬藏窗口期引起内容抖动）。
 static void sp_sb_sync_on_attach(UIView *view) {
-    if (!gKeepStatusBar) return;
     UIWindow *win = view.window;
+    // 锁屏取证（1.3.16→1.3.18）：锁屏/切换器语境的前景视图 attach 时 dump 子树 +
+    // 终态双点（0.6s/2.5s），放在 keepStatusBar 门控之前，两种开关模式下都取证。
+    if (win && sp_window_is_lock_context(win)) {
+        sp_sb_dump_around(view);
+        sp_sb_schedule_dump_later(view);
+        if (sp_should_restore_lock_bar(win)) sp_restore_lock_bar(view);
+    }
+    if (!gKeepStatusBar) return;
     if (!win || !sp_window_is_home_context(win)) {
         sp_restore_theme_yield(view);
         return;
@@ -470,16 +670,27 @@ static void sp_sb_sync_on_attach(UIView *view) {
 }
 
 static void sp_sb_assert_on_layout(UIView *view) {
-    if (!gKeepStatusBar) return;
     UIWindow *win = view.window;
+    // 锁屏语境右簇还原（1.3.19）：layoutSubviews 单向重申，独立于保留系统栏开关
+    // （Lunora 引擎会重申压制，这里每次布局对打回去）。
+    if (win && sp_should_restore_lock_bar(win)) {
+        sp_restore_lock_bar(view);
+        return;
+    }
+    if (!gKeepStatusBar) return;
     if (!win || !sp_window_is_home_context(win)) return;
     UIView *overlay = sp_theme_overlay_for(view);
     if (overlay) {
-        // 单向重申（只让位不恢复，防抖动）；桌面语境自证武装后声明态胶囊也算数。
         sp_arm_grace_if_desktop(view, overlay);
         if (sp_theme_capsules_effective(overlay) ||
-            (sp_cc_grace_active() && sp_theme_capsules_declared(overlay)))
+            (sp_cc_grace_active() && sp_theme_capsules_declared(overlay))) {
             sp_apply_theme_yield(view, overlay);
+        } else {
+            // 覆盖层在但胶囊失效（Lunora 关闭/瞬藏且宽限不在）：收回让位，
+            // 原生回归——修"关闭 Lunora 后右列不显示"的滞留态（1.3.22）。
+            // 此前该分支什么都不做，alpha=0 滞留到下一次有效胶囊才被处理。
+            sp_restore_theme_yield(view);
+        }
     } else if (gThemeSeenRecent() && objc_getAssociatedObject(view, &spSbYieldedKey)) {
         // overlay 暂不可得：宽限内持续记忆让位（补后到的子视图）；宽限过期恢复原生。
         if (sp_cc_grace_active()) sp_grace_recall_yield(view);
@@ -538,6 +749,27 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
             sp_restore_theme_yield(view);
         }
         orig(self, _cmd, alpha);
+        return;
+    }
+
+    // 锁屏护栏（1.3.22 收口）：只在"锁屏还原语境"整条保活——CoverSheet 恒定；
+    // MainSwitcher/StatusBarWindow 仅 UI 锁定时。解锁状态的 MainSwitcher 属主屏
+    // 语境，Lunora 的主屏样式（整条压暗+胶囊悬浮）必须按主屏规则处理——1.3.18
+    // 的无条件覆盖把它拦死（报告(6) L487-496 ×10 实证）。护栏与还原共用
+    // sp_should_restore_lock_bar 同一语境判定。
+    if (win && sp_should_restore_lock_bar(win)) {
+        if (!gKeptViews) gKeptViews = [NSHashTable weakObjectsHashTable];
+        [gKeptViews addObject:view];
+        if (gLockGuardLogBudget > 0) {
+            gLockGuardLogBudget--;
+            sp_log(@"lock guard: kept hide view=%@ %p win=%@ caller=%s uiLocked=%d",
+                   NSStringFromClass([view class]), (__bridge void *)view,
+                   NSStringFromClass([win class]),
+                   sp_caller_is_solo(caller) ? "solo" : "other",
+                   sp_device_ui_locked() ? 1 : 0);
+        }
+        orig(self, _cmd, 1.0f);
+        if (sp_should_restore_lock_bar(win)) sp_restore_lock_bar(view);
         return;
     }
 
@@ -622,16 +854,22 @@ static void sp_common_set_alpha(id self, SEL _cmd, CGFloat alpha,
         return;
     }
 
-    // caller=other 且主屏无主题覆盖：放行（系统自身行为），留痕 + 首次 dump。
+    // caller=other 且主屏无主题覆盖：keep=1 语义下整条保活（1.3.23）。
+    // 此前放行（当作"系统自身行为"）——但 Lunora 关闭后其引擎仍在压暗
+    // （overlay 已消失、主题判定失效），放行 = 主屏原生栏被隐藏且无状态栏
+    // 可看（报告(8) L160/260/401 实证）。keep=1 的语义就是主屏原生栏不隐藏；
+    // keep=0 到不了这里（更早已放行归 Solo）。
+    if (!gKeptViews) gKeptViews = [NSHashTable weakObjectsHashTable];
+    [gKeptViews addObject:view];
     if (gUnmatchedStatusLogBudget > 0) {
         gUnmatchedStatusLogBudget--;
-        sp_log(@"ignored statusbar hide: view=%@ %p superview=%@ win=%@ caller=other",
+        sp_log(@"blocked statusbar hide: view=%@ %p win=%@ caller=%s (no theme, keep=1)",
                NSStringFromClass([view class]), (__bridge void *)view,
-               NSStringFromClass([view.superview class]),
-               win ? NSStringFromClass([win class]) : @"(nil)");
+               win ? NSStringFromClass([win class]) : @"(nil)",
+               fromSolo ? "solo" : "other");
     }
     sp_sb_dump_around(view);
-    orig(self, _cmd, alpha);
+    orig(self, _cmd, 1.0f);
 }
 
 static void sp_setAlpha_ui(id self, SEL _cmd, CGFloat alpha) {
@@ -854,15 +1092,12 @@ static void sp_schedule_status_retry(void) {
 }
 
 
-#pragma mark - Dock（图标上限 / 大小 / 自动下移）
+#pragma mark - Dock（图标上限；大小/间距/位移由第三方插件 Atria 等调节）
 
 static char spModelLocationKey = 0;
-static char spDockImageBaseKey = 0;
-static char spDockImageScaleKey = 0;
-static NSHashTable *gDockImageViews = nil;
 static __weak id gDockListView = nil;
+static __weak id gDockModel = nil;   // 直接记住 Dock model：列表视图重建/转场时仍可判身份
 static int gDockModelLogBudget = 4;
-static int gDockScaleLogBudget = 6;
 
 static NSUInteger sp_dock_icon_count(id listView) {
     if (!listView || ![listView respondsToSelector:@selector(icons)]) return 0;
@@ -879,33 +1114,25 @@ static void sp_mark_model_location(id model, NSString *loc) {
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
-static NSString *sp_model_location(id model) {
-    if (!model) return nil;
-    id loc = objc_getAssociatedObject(model, &spModelLocationKey);
-    if (![loc isKindOfClass:[NSString class]]) {
-        SEL s = NSSelectorFromString(@"_atriaLocation");
-        if ([model respondsToSelector:s]) {
-            loc = ((id (*)(id, SEL))objc_msgSend)(model, s);
-        }
-    }
-    return [loc isKindOfClass:[NSString class]] ? loc : nil;
-}
-
 static id sp_dock_model(void) {
-    id list = gDockListView;
-    if (list && [list respondsToSelector:@selector(model)]) {
-        return ((id (*)(id, SEL))objc_msgSend)(list, @selector(model));
-    }
-    return nil;
+    // gDockModel 由 sp_note_dock_list() 在每次 Dock 布局钩子（maximumIconCount /
+    // iconRows/layoutIconsNow/layoutSubviews）里刷新，Dock 有任何活动即已就绪。
+    // 不在这里扫窗口：残旧的 Dock 列表视图若被扫到，反而会拿到过期 model。
+    return gDockModel;
 }
 
 static BOOL sp_model_is_dock(id model) {
-    // 以 Dock 列表当前的 model 指针为准；文件夹内部模型即使 location
-    // 字符串里带 Dock，也不会被误判、误改 gridSize/容量。
+    // 严格指针身份：只认 gDockModel 记住的那一枚 Dock model。
+    // 旧的 location 回落会误判文件夹内部 model（Atria 的 _atriaLocation 可能含
+    // "Dock"）：调试报告(20) 里 "dock model gridSize: count=5" 就是实锤证据——
+    // Dock 实为 6 图标，count=5 的日志只会来自被误判的文件夹 model。误判后
+    // 文件夹 gridSize 被套成竖排 {1,6}、freeSlots/isFull/maxIcons 一起放大 →
+    // 已满首页拖入应用时排到"下一行"而非新建一页 → 坐标变 NSNotFound →
+    // addPlaceholderAtGridCellIndex: 断言（安全模式）/ 图标错位持久化。
+    // gDockModel 未就绪时宁可不改任何 model 层行为（视图层 sp_dock_max /
+    // sp_dock_rows 已兜底），绝不误伤文件夹。
     id dm = sp_dock_model();
-    if (dm) return model == dm;
-    NSString *loc = sp_model_location(model);
-    return loc && [loc containsString:@"Dock"];
+    return dm && model == dm;
 }
 
 // 防呆：配置值不能低于当前已有图标数，避免 6 -> 5 时强制挤出。
@@ -923,6 +1150,7 @@ static void sp_note_dock_list(id listView) {
     SEL ms = @selector(model);
     if (![listView respondsToSelector:ms]) return;
     id model = ((id (*)(id, SEL))objc_msgSend)(listView, ms);
+    gDockModel = model;
     sp_mark_model_location(model, @"SBIconLocationDock");
 }
 
@@ -930,8 +1158,6 @@ static NSUInteger (*sp_orig_dock_max)(id, SEL) = NULL;
 static NSUInteger (*sp_orig_dock_rows)(id, SEL) = NULL;
 static void (*sp_orig_dock_layoutIconsNow)(id, SEL) = NULL;
 static void (*sp_orig_dock_layoutSubviews)(id, SEL) = NULL;
-static BOOL spApplyingDockListScale = NO;
-static void (*sp_orig_dock_setCenter)(id, SEL, CGPoint) = NULL;
 static NSUInteger (*sp_orig_model_max)(id, SEL) = NULL;
 static NSUInteger (*sp_orig_model_maxCount)(id, SEL) = NULL;
 static NSUInteger (*sp_orig_model_free)(id, SEL) = NULL;
@@ -942,8 +1168,6 @@ static BOOL (*sp_orig_model_canAdd)(id, SEL, id) = NULL;
 static BOOL (*sp_orig_model_canAddAt)(id, SEL, id, NSUInteger) = NULL;
 static id (*sp_orig_model_insert)(id, SEL, id, NSUInteger) = NULL;
 static id (*sp_orig_model_insertMany)(id, SEL, id, NSUInteger, NSUInteger) = NULL;
-static void (*sp_orig_view_setTransform)(id, SEL, CGAffineTransform) = NULL;
-static void (*sp_orig_layer_addAnimation)(id, SEL, CAAnimation *, NSString *) = NULL;
 static int gDockDropLogBudget = 12;
 
 static NSUInteger sp_model_icon_count(id model) {
@@ -999,6 +1223,9 @@ static sp_icon_grid_size sp_model_grid_size(id self, SEL _cmd) {
     sp_icon_grid_size g = {0, 0};
     if (sp_orig_model_gridSize) g = sp_orig_model_gridSize(self, _cmd);
     if (sp_model_is_dock(self)) {
+        // Atria 对 root 会返回 0x7FFF×0x7FFF 这类哨兵值防挤走；Dock 若也拿到
+        // 这种值不要覆盖，交给原实现，避免破坏它的布局账本。
+        if (g.width > 1000 || g.height > 1000) return g;
         unsigned short want = (unsigned short)sp_effective_dock_max(sp_model_icon_count(self));
         // 关键：gridSize 的方向必须跟 Solo/Atria 实际布局一致（竖排 1×N）。
         id list = gDockListView;
@@ -1014,12 +1241,20 @@ static sp_icon_grid_size sp_model_grid_size(id self, SEL _cmd) {
         if (cols > 0 && rows > 0) {
             g.width = (unsigned short)cols;
             g.height = (unsigned short)rows;
-        } else {
+            // 长轴必须能容纳 want 个槽。此前只照抄视图值：6 图标时视图仍报
+            // 1×5，拖起第 6 个图标的 placeholder 索引越界 → SBIconListView
+            // addPlaceholderAtGridCellIndex: 断言 abort → 连续崩溃进安全模式
+            // （2026-11-24 SpringBoard-175924.ips 实锤）。
             if (g.width >= g.height) {
                 if (g.width < want) g.width = want;
             } else {
                 if (g.height < want) g.height = want;
             }
+        } else {
+            // gDockListView 在 CC 转场/编辑态重建列表时会短暂为 nil：此时必须
+            // 按竖排 1×N 兜底，绝不能把 1×6 写成横排 6×1（旧 fallback 的洞）。
+            g.width = 1;
+            g.height = want;
         }
         if (gDockDropLogBudget > 0) {
             gDockDropLogBudget--;
@@ -1034,9 +1269,13 @@ static sp_icon_grid_size sp_model_grid_size(id self, SEL _cmd) {
 static NSUInteger sp_model_free_slots(id self, SEL _cmd) {
     NSUInteger base = sp_orig_model_free ? sp_orig_model_free(self, _cmd) : 0;
     if (sp_model_is_dock(self)) {
-        // 与 Atria 对 root 的处理一致：先让模型不要用“满槽”挡住投放，
-        // 真正的上限由 maxNumberOfIcons 卡住。
-        return NSUIntegerMax;
+        // 旧实现返回 NSUIntegerMax（照抄 Atria 对 root 列表的“无限槽”策略）。
+        // Dock 是定长网格，无限槽会让拖放系统按不存在的索引创建 placeholder，
+        // 在 addPlaceholderAtGridCellIndex: 里断言 abort。改为报告真实剩余槽数：
+        // 6 图标配置下还剩 1 个槽就报 1，满了就报 0（同时不挡住第 6 个投放）。
+        NSUInteger n = sp_model_icon_count(self);
+        NSUInteger effective = sp_effective_dock_max(n);
+        return effective > n ? effective - n : 0;
     }
     return base;
 }
@@ -1080,10 +1319,17 @@ static BOOL sp_model_can_add(id self, SEL _cmd, id icon) {
 
 static BOOL sp_model_can_add_at(id self, SEL _cmd, id icon, NSUInteger idx) {
     BOOL base = sp_orig_model_canAddAt ? sp_orig_model_canAddAt(self, _cmd, icon, idx) : NO;
-    if (gDockMaxIcons >= 5.5 && sp_model_is_dock(self)
-        && sp_model_icon_count(self) < (NSUInteger)gDockMaxIcons
-        && sp_icon_is_app(icon)) {
-        base = YES;
+    if (sp_model_is_dock(self)) {
+        NSUInteger n = sp_model_icon_count(self);
+        NSUInteger effective = sp_effective_dock_max(n);
+        // 6 图标配置下，只有 idx < 有效槽数才是合法投放点。旧实现只看
+        // count < gDockMaxIcons，拖放系统传来的越界 idx 也放行 → placeholder
+        // 按越界 gridCellIndex 创建时断言 abort（见 gridSize 处的 .ips 说明）。
+        if (idx >= effective) {
+            base = NO;
+        } else if (gDockMaxIcons >= 5.5 && n < effective && sp_icon_is_app(icon)) {
+            base = YES;
+        }
     }
     if (gDockDropLogBudget > 0 && sp_model_is_dock(self)) {
         gDockDropLogBudget--;
@@ -1096,7 +1342,28 @@ static BOOL sp_model_can_add_at(id self, SEL _cmd, id icon, NSUInteger idx) {
 
 static id sp_model_insert_one(id self, SEL _cmd, id icon, NSUInteger idx) {
     NSUInteger before = sp_model_icon_count(self);
-    id result = sp_orig_model_insert ? sp_orig_model_insert(self, _cmd, icon, idx) : nil;
+    if (sp_model_is_dock(self)) {
+        NSUInteger effective = sp_effective_dock_max(before);
+        if (idx >= effective) {
+            // 越界 idx 直接拒绝并留日志：不把坏索引交给 SpringBoardHome，
+            // 其 addPlaceholderAtGridCellIndex: 断言会 abort（见 gridSize 注释）。
+            if (gDockDropLogBudget > 0) {
+                gDockDropLogBudget--;
+                sp_log(@"dock insertIcon: rejected out-of-range idx=%lu count=%lu cap=%lu",
+                       (unsigned long)idx, (unsigned long)before, (unsigned long)effective);
+            }
+            return nil;
+        }
+    }
+    id result = nil;
+    @try {
+        result = sp_orig_model_insert ? sp_orig_model_insert(self, _cmd, icon, idx) : nil;
+    } @catch (NSException *e) {
+        // 兜底闸门：模型内部断言异常绝不冒泡到 CFRunLoop（会 terminate 进安全模式）。
+        sp_log(@"dock insertIcon: caught %@ idx=%lu count=%lu", e.reason ?: @"(nil)",
+               (unsigned long)idx, (unsigned long)before);
+        return nil;
+    }
     if (gDockMaxIcons >= 5.5 && sp_model_is_dock(self) && gDockDropLogBudget > 0) {
         gDockDropLogBudget--;
         sp_log(@"dock insertIcon: %@ idx=%lu count=%lu -> %lu result=%p",
@@ -1110,8 +1377,26 @@ static id sp_model_insert_one(id self, SEL _cmd, id icon, NSUInteger idx) {
 static id sp_model_insert_many(id self, SEL _cmd, id icons, NSUInteger idx,
                                NSUInteger options) {
     NSUInteger before = sp_model_icon_count(self);
-    id result = sp_orig_model_insertMany
-        ? sp_orig_model_insertMany(self, _cmd, icons, idx, options) : nil;
+    if (sp_model_is_dock(self)) {
+        NSUInteger effective = sp_effective_dock_max(before);
+        if (idx >= effective) {
+            if (gDockDropLogBudget > 0) {
+                gDockDropLogBudget--;
+                sp_log(@"dock insertIcons: rejected out-of-range idx=%lu count=%lu cap=%lu",
+                       (unsigned long)idx, (unsigned long)before, (unsigned long)effective);
+            }
+            return nil;
+        }
+    }
+    id result = nil;
+    @try {
+        result = sp_orig_model_insertMany
+            ? sp_orig_model_insertMany(self, _cmd, icons, idx, options) : nil;
+    } @catch (NSException *e) {
+        sp_log(@"dock insertIcons: caught %@ idx=%lu count=%lu", e.reason ?: @"(nil)",
+               (unsigned long)idx, (unsigned long)before);
+        return nil;
+    }
     if (gDockMaxIcons >= 5.5 && sp_model_is_dock(self) && gDockDropLogBudget > 0) {
         gDockDropLogBudget--;
         sp_log(@"dock insertIcons: idx=%lu count=%lu -> %lu options=%lu result=%p",
@@ -1122,232 +1407,79 @@ static id sp_model_insert_many(id self, SEL _cmd, id icons, NSUInteger idx,
     return result;
 }
 
-static BOOL sp_tf_close(CGAffineTransform a, CGAffineTransform b) {
-    return fabs(a.a - b.a) < 1e-4 && fabs(a.b - b.b) < 1e-4
-        && fabs(a.c - b.c) < 1e-4 && fabs(a.d - b.d) < 1e-4
-        && fabs(a.tx - b.tx) < 1e-4 && fabs(a.ty - b.ty) < 1e-4;
-}
+// 崩溃栈终点防护（SpringBoard-2026-11-24-175924.ips）：
+// SBIconDragManager 抬升完成 → addPlaceholderRepresentingIcon: →
+// addPlaceholderAtGridCellIndex: 内 NSAssert 抛异常 → 冒泡到 CFRunLoop →
+// abort / 连续 3 次崩溃进安全模式。上面把模型容量、gridSize、投放索引全部
+// 收敛后仍可能有上游（Solo/Atria 的 hook 链）算出越界 index，这里在最后一环
+// 拦住：Dock 列表的越界索引直接拒绝，并用 @try/@catch 兜住任何内部断言，
+// 不让异常冒泡到 runloop。其它列表（主屏/文件夹）原样转发，零影响。
+// reason / options 在私有头文件里可能是对象或枚举，用 uintptr_t 保持 ABI 中立：
+// arm64 下与 id / NSUInteger 同为 8 字节寄存器传递，转发原实现完全等价。
+static id (*sp_orig_add_placeholder_at)(id, SEL, NSUInteger, id,
+                                        uintptr_t, uintptr_t) = NULL;
 
-static CGAffineTransform sp_tf_with_scale(CGAffineTransform base, CGFloat scale) {
-    return CGAffineTransformConcat(base, CGAffineTransformMakeScale(scale, scale));
-}
-
-// 判断某个 view 是否是 Dock 图标内部的 _iconImageView。
-static BOOL sp_is_dock_icon_image_view(UIView *v) {
-    if (!v) return NO;
-    NSString *cn = NSStringFromClass([v class]);
-    UIView *sv = v.superview;
-    NSString *sn = sv ? NSStringFromClass([sv class]) : nil;
-    if (![cn containsString:@"Image"] && ![sn containsString:@"IconView"]) return NO;
-
-    UIView *iconView = nil;
-    UIView *p = sv;
-    for (int i = 0; p && i < 4; i++) {
-        if ([NSStringFromClass([p class]) containsString:@"IconView"]) {
-            iconView = p;
-            break;
+static id sp_add_placeholder_at(id self, SEL _cmd, NSUInteger idx,
+                                id icon, uintptr_t reason, uintptr_t options) {
+    // 调试报告(20) 实机：文件夹首页满时系统下发 idx=NSNotFound
+    // (0x7FFFFFFFFFFFFFFF = 9223372036854775807)。前置拒绝，不让
+    // SpringBoardHome 抛断言异常，也不给半状态留机会。
+    if (idx == (NSUInteger)NSNotFound) {
+        static int sentinelBudget = 12;
+        if (sentinelBudget > 0) {
+            sentinelBudget--;
+            sp_log(@"placeholder: rejected NSNotFound on %@",
+                   NSStringFromClass([self class]));
         }
-        p = p.superview;
+        return nil;
     }
-    if (!iconView) return NO;
-
-    SEL locSel = @selector(location);
-    if ([iconView respondsToSelector:locSel]) {
-        id loc = ((id (*)(id, SEL))objc_msgSend)(iconView, locSel);
-        if ([loc isKindOfClass:[NSString class]] && [loc containsString:@"Dock"]) {
-            return YES;
+    BOOL isDock = objc_getClass("SBDockIconListView")
+               && [self isKindOfClass:objc_getClass("SBDockIconListView")];
+    if (isDock) {
+        NSUInteger cap = sp_effective_dock_max(sp_dock_icon_count(self));
+        if (idx >= cap) {
+            sp_log(@"dock placeholder: rejected idx=%lu cap=%lu (icon=%@)",
+                   (unsigned long)idx, (unsigned long)cap,
+                   NSStringFromClass([icon class]));
+            return nil;
         }
-    }
-    SEL iconSel = @selector(icon);
-    if ([iconView respondsToSelector:iconSel]) {
-        id icon = ((id (*)(id, SEL))objc_msgSend)(iconView, iconSel);
-        if (icon && [icon respondsToSelector:locSel]) {
-            id loc = ((id (*)(id, SEL))objc_msgSend)(icon, locSel);
-            if ([loc isKindOfClass:[NSString class]] && [loc containsString:@"Dock"]) {
-                return YES;
-            }
-        }
-    }
-    UIView *q = iconView.superview;
-    while (q) {
-        if ([NSStringFromClass([q class]) isEqualToString:@"SBDockIconListView"]) return YES;
-        q = q.superview;
-    }
-    return NO;
-}
-
-static void sp_view_setTransform(id self, SEL _cmd, CGAffineTransform t) {
-    if ([self isKindOfClass:[UIView class]] && sp_is_dock_icon_image_view((UIView *)self)) {
-        if (!gDockImageViews) gDockImageViews = [NSHashTable weakObjectsHashTable];
-        [gDockImageViews addObject:self];
-
-        CGAffineTransform base = t;
-        NSValue *oldBaseV = objc_getAssociatedObject(self, &spDockImageBaseKey);
-        if (oldBaseV) {
-            CGAffineTransform oldBase;
-            [oldBaseV getValue:&oldBase];
-            // 只接受 Solo 的正常基准（约 0.83）或旧基准；动画中间值不覆盖基准，
-            // 否则会出现 0.829 -> 0.704 -> 0.599 -> 0.433 的连环缩小。
-            if (t.a >= 0.75 || sp_tf_close(t, oldBase)) base = t;
-            else base = oldBase;
-        }
-        if (base.a < 0.1) base = CGAffineTransformIdentity;
-        objc_setAssociatedObject(self, &spDockImageBaseKey,
-                                 [NSValue valueWithCGAffineTransform:base],
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, &spDockImageScaleKey, @(gDockIconScale),
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        CGAffineTransform out = sp_tf_with_scale(base, gDockIconScale);
-        if (gDockScaleLogBudget > 0) {
-            gDockScaleLogBudget--;
-            sp_log(@"dock icon image scale: cls=%@ base=%.3f -> %.3f (slider=%.2f)",
-                   NSStringFromClass([self class]), base.a, out.a, gDockIconScale);
-        }
-        if (sp_orig_view_setTransform) sp_orig_view_setTransform(self, _cmd, out);
-        return;
-    }
-    if (sp_orig_view_setTransform) sp_orig_view_setTransform(self, _cmd, t);
-}
-
-static void sp_scale_dock_icon_view(UIView *iconView) {
-    if (!iconView) return;
-    SEL imgSel = @selector(_iconImageView);
-    if (![iconView respondsToSelector:imgSel]) return;
-    UIView *img = ((id (*)(id, SEL))objc_msgSend)(iconView, imgSel);
-    if (!img) return;
-
-    CGAffineTransform base;
-    NSValue *baseV = objc_getAssociatedObject(img, &spDockImageBaseKey);
-    if (baseV) {
-        [baseV getValue:&base];
-    } else {
-        base = img.transform;
-        if (base.a < 0.1) base = CGAffineTransformIdentity;
-        objc_setAssociatedObject(img, &spDockImageBaseKey,
-                                 [NSValue valueWithCGAffineTransform:base],
-                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-    CGAffineTransform out = sp_tf_with_scale(base, gDockIconScale);
-    if (sp_orig_view_setTransform) {
-        sp_orig_view_setTransform(img, @selector(setTransform:), out);
-    }
-    objc_setAssociatedObject(img, &spDockImageScaleKey, @(gDockIconScale),
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (!gDockImageViews) gDockImageViews = [NSHashTable weakObjectsHashTable];
-    [gDockImageViews addObject:img];
-}
-
-static void sp_apply_dock_scale_in_view(UIView *v, int depth) {
-    if (!v || depth > 3) return;
-    NSString *cn = NSStringFromClass([v class]);
-    if ([cn containsString:@"IconView"]) {
-        sp_scale_dock_icon_view(v);
-        return;
-    }
-    for (UIView *sub in v.subviews) sp_apply_dock_scale_in_view(sub, depth + 1);
-}
-
-static UIView *sp_find_dock_list_in_view(UIView *v, int depth) {
-    if (!v || depth > 6) return nil;
-    if ([NSStringFromClass([v class]) isEqualToString:@"SBDockIconListView"]) return v;
-    for (UIView *sub in v.subviews) {
-        UIView *r = sp_find_dock_list_in_view(sub, depth + 1);
-        if (r) return r;
-    }
-    return nil;
-}
-
-static void sp_apply_dock_scale_to_all(void) {
-    id list = gDockListView;
-    if (!list) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            UIView *found = sp_find_dock_list_in_view(w, 0);
-            if (found) { list = found; gDockListView = found; break; }
+        @try {
+            return sp_orig_add_placeholder_at
+                ? sp_orig_add_placeholder_at(self, _cmd, idx, icon, reason, options) : nil;
+        } @catch (NSException *e) {
+            sp_log(@"dock placeholder: caught %@ idx=%lu cap=%lu",
+                   e.reason ?: @"(nil)", (unsigned long)idx, (unsigned long)cap);
+            return nil;
         }
     }
-    if (!list) return;
-    sp_apply_dock_scale_in_view((UIView *)list, 0);
-}
-
-static void sp_apply_dock_content_scale_in_view(UIView *v, int depth) {
-    if (!v || depth > 3) return;
-    NSString *cn = NSStringFromClass([v class]);
-    if ([cn containsString:@"IconView"]) {
-        SEL setSel = @selector(setIconContentScale:);
-        SEL getSel = @selector(iconContentScale);
-        if ([v respondsToSelector:setSel]) {
-            CGFloat cur = 1.0;
-            if ([v respondsToSelector:getSel]) {
-                cur = ((CGFloat (*)(id, SEL))objc_msgSend)(v, getSel);
-            }
-            if (fabs(cur - gDockIconScale) > 0.001) {
-                @try {
-                    ((void (*)(id, SEL, CGFloat))objc_msgSend)(v, setSel, gDockIconScale);
-                } @catch (__unused NSException *e) {}
-            }
+    // .ips 未记录拖拽发生在哪一页列表：非 Dock 列表也做异常兜底，
+    // 保证任何来源的 addPlaceholder 断言都不会冒泡到 CFRunLoop 触发 abort。
+    @try {
+        return sp_orig_add_placeholder_at
+            ? sp_orig_add_placeholder_at(self, _cmd, idx, icon, reason, options) : nil;
+    } @catch (NSException *e) {
+        static int budget = 12;
+        if (budget > 0) {
+            budget--;
+            sp_log(@"placeholder: caught %@ on %@ idx=%lu",
+                   e.reason ?: @"(nil)", NSStringFromClass([self class]),
+                   (unsigned long)idx);
         }
-        return;
-    }
-    for (UIView *sub in v.subviews) sp_apply_dock_content_scale_in_view(sub, depth + 1);
-}
-
-static void sp_apply_dock_list_scale(void) {
-    id list = gDockListView;
-    if (!list) {
-        for (UIWindow *w in [UIApplication sharedApplication].windows) {
-            UIView *found = sp_find_dock_list_in_view(w, 0);
-            if (found) { list = found; gDockListView = found; break; }
-        }
-    }
-    if (!list || spApplyingDockListScale) return;
-    // 只缩图标内容，不改 SBDockIconListView 的 frame/transform；
-    // 这样打开 App/文件夹的动画落点仍按原始 Dock 几何计算，不会被二次纠正。
-    spApplyingDockListScale = YES;
-    sp_apply_dock_content_scale_in_view((UIView *)list, 0);
-    spApplyingDockListScale = NO;
-    if (gDockScaleLogBudget > 0) {
-        gDockScaleLogBudget--;
-        sp_log(@"dock icon content scale applied: %.2f (view=%@)",
-               gDockIconScale, NSStringFromClass([list class]));
+        return nil;
     }
 }
 
 static void sp_dock_layoutIconsNow(id self, SEL _cmd) {
     if (sp_orig_dock_layoutIconsNow) sp_orig_dock_layoutIconsNow(self, _cmd);
+    // 缩放/位移已移交第三方插件（Atria 等），本钩子只剩一个职责：
+    // 刷新 gDockListView / gDockModel —— 模型层严格指针身份的唯一数据源。
+    // 删掉这里，文件夹 model 误判（调试报告(20) count=5 错位）就会回归。
     sp_note_dock_list(self);
-    sp_apply_dock_list_scale();
 }
 
 static void sp_dock_layoutSubviews(id self, SEL _cmd) {
     if (sp_orig_dock_layoutSubviews) sp_orig_dock_layoutSubviews(self, _cmd);
     sp_note_dock_list(self);
-    sp_apply_dock_list_scale();
-}
-
-static void sp_reapply_dock_icon_scale(void) {
-    sp_apply_dock_list_scale();
-}
-
-static id sp_scaled_catransform_value(id v, CGFloat scale) {
-    if (![v isKindOfClass:[NSValue class]]) return v;
-    CATransform3D t;
-    [v getValue:&t];
-    t = CATransform3DScale(t, scale, scale, 1.0);
-    return [NSValue valueWithCATransform3D:t];
-}
-
-static void sp_layer_addAnimation(id self, SEL _cmd, CAAnimation *anim, NSString *key) {
-    if (gDockIconScale < 0.999 && [key isEqualToString:@"UnduoDockScale"]
-        && [anim isKindOfClass:[CABasicAnimation class]]) {
-        CABasicAnimation *a = (CABasicAnimation *)anim;
-        a.fromValue = sp_scaled_catransform_value(a.fromValue, gDockIconScale);
-        a.toValue = sp_scaled_catransform_value(a.toValue, gDockIconScale);
-        if (gDockScaleLogBudget > 0) {
-            gDockScaleLogBudget--;
-            sp_log(@"dock scale animation: from/to multiplied by %.2f", gDockIconScale);
-        }
-    }
-    if (sp_orig_layer_addAnimation) sp_orig_layer_addAnimation(self, _cmd, anim, key);
 }
 
 static int spEvictAttempts = 0;
@@ -1545,13 +1677,6 @@ static void sp_schedule_evict(double delay) {
     }
 }
 
-static void sp_dock_setCenter(id self, SEL _cmd, CGPoint c) {
-    if (gDockAutoShift && gDockMaxIcons >= 5.5 && sp_dock_icon_count(self) >= 6) {
-        c.y += 12.0;
-    }
-    if (sp_orig_dock_setCenter) sp_orig_dock_setCenter(self, _cmd, c);
-}
-
 static BOOL sp_install_dock_hooks(void) {
     static BOOL installed = NO;
     if (installed) return YES;
@@ -1562,7 +1687,6 @@ static BOOL sp_install_dock_hooks(void) {
 
     MSHookMessageEx(dock, @selector(maximumIconCount), (IMP)sp_dock_max, (IMP *)&sp_orig_dock_max);
     MSHookMessageEx(dock, @selector(iconRowsForCurrentOrientation), (IMP)sp_dock_rows, (IMP *)&sp_orig_dock_rows);
-    MSHookMessageEx(dock, @selector(setCenter:), (IMP)sp_dock_setCenter, (IMP *)&sp_orig_dock_setCenter);
     MSHookMessageEx(dock, @selector(layoutIconsNow), (IMP)sp_dock_layoutIconsNow, (IMP *)&sp_orig_dock_layoutIconsNow);
     SEL layoutSubviewsSel = @selector(layoutSubviews);
     if (class_getInstanceMethod(dock, layoutSubviewsSel)) {
@@ -1615,17 +1739,34 @@ static BOOL sp_install_dock_hooks(void) {
         MSHookMessageEx(model, insertManySel, (IMP)sp_model_insert_many, (IMP *)&sp_orig_model_insertMany);
     }
 
-    // 图标缩放改由 SBDockIconListView 父层 transform 完成；不再逐图标 hook
-    // UIView setTransform / CALayer addAnimation，避免重排时回弹与卡顿。
+    // 崩溃栈终点：SBIconListView addPlaceholderAtGridCellIndex:representingIcon:
+    // reason:options:（挂在其父类 SBIconListView 上，Dock 列表继承）。
+    // ABI 守卫：必须 self+_cmd+4 参 = 6，且返回对象；签名漂移时不装，
+    // 退回前面各层容量/索引收敛，绝不匹配错误原型。
+    SEL placeholderSel = @selector(addPlaceholderAtGridCellIndex:representingIcon:reason:options:);
+    Method placeholderMethod = class_getInstanceMethod(objc_getClass("SBIconListView"),
+                                                      placeholderSel);
+    if (placeholderMethod && method_getNumberOfArguments(placeholderMethod) == 6) {
+        char ret[16] = {0};
+        method_getReturnType(placeholderMethod, ret, sizeof(ret));
+        if (ret[0] == '@') {
+            MSHookMessageEx(objc_getClass("SBIconListView"), placeholderSel,
+                            (IMP)sp_add_placeholder_at,
+                            (IMP *)&sp_orig_add_placeholder_at);
+        }
+    }
+
+    // Dock 图标大小/间距/上下移交给第三方插件（Atria 等）调节，本插件不再
+    // hook setCenter / UIView setTransform / CALayer addAnimation。
 
     installed = YES;
-    sp_log(@"dock hooks installed (max=%.0f scale=%.2f shift=%d max=%d maxCount=%d free=%d grid=%d full=%d canAdd=%d canAddAt=%d insert=%d insertMany=%d anim=%d)",
-           gDockMaxIcons, gDockIconScale, gDockAutoShift,
+    sp_log(@"dock hooks installed (max=%.0f max=%d maxCount=%d free=%d grid=%d full=%d canAdd=%d canAddAt=%d insert=%d insertMany=%d placeholder=%d)",
+           gDockMaxIcons,
            sp_orig_model_max != NULL, sp_orig_model_maxCount != NULL,
            sp_orig_model_free != NULL, sp_orig_model_gridSize != NULL,
            sp_orig_model_isFull != NULL, sp_orig_model_canAdd != NULL,
            sp_orig_model_canAddAt != NULL, sp_orig_model_insert != NULL,
-           sp_orig_model_insertMany != NULL, sp_orig_layer_addAnimation != NULL);
+           sp_orig_model_insertMany != NULL, sp_orig_add_placeholder_at != NULL);
     return YES;
 }
 
@@ -2634,7 +2775,6 @@ static void sp_notify_cb(CFNotificationCenterRef center, void *observer,
     sp_refresh_carousel();
     if (gKeepStatusBar) sp_force_show_all();
     sp_apply_data_label_live();
-    sp_reapply_dock_icon_scale();
     sp_apply_duo_visibility();
     sp_locate_duo_anchor();
     sp_apply_duo_time_visibility();

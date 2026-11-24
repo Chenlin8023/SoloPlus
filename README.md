@@ -4,7 +4,7 @@ Solo+ 是 **Solo 1.0.1** 的运行时增强层，不修改 Solo 本体。
 
 发布形态：
 
-- **合并完整版「Solo1.0.1优化」**（`com.chenlin8023.solo.full`，`1.0.1-24`）——Solo 1.0.1 本体 + Solo+ 1.3.8 合为单包，已上架越狱源 `https://chenlin8023.github.io/`；
+- **合并完整版「Solo1.0.1优化」**（`com.chenlin8023.solo.full`，`1.0.1-41`）——Solo 1.0.1 本体 + Solo+ 1.3.25 合为单包，已上架越狱源 `https://chenlin8023.github.io/`；
 - **独立增强包**（`com.chenlin8023.soloplus`，`1.3.8`）——只含增强层，需自备官方 Solo 1.0.1，本地自用。
 
 > 本项目是非官方增强包，与 Solo 作者 OaksTheAwesome、Atria 作者 ren7995 均无隶属关系。
@@ -21,9 +21,7 @@ Solo+ 是 **Solo 1.0.1** 的运行时增强层，不修改 Solo 本体。
 | 增强 → Duo → Duo 细节 | Duo 下方电量 | Duo 整行下方显示剩余电量百分比；与读数同字族字重；≤20% 红色、充电绿色；默认开 |
 | 增强 → Duo → Duo 细节 | 隐藏 Duo 下方图标 | 隐藏读数下方的定位箭头等图片类符号（≤44pt），不碰电量标签；默认开 |
 | 增强 → Duo → Duo 细节 | 电量上下微调 | -8 / -4 / 0 / +4 / +8 pt，位置不合适时手动推一档 |
-| 增强 → Dockicon | Dock 6 图标 | 竖排 Dock 上限 5/6；6 个图标需手动拖入；切回 5 后注销会自动把最后一个图标迁回主屏 |
-| 增强 → Dockicon | 图标大小 | 0.85–1.0，使用 `iconContentScale` 只缩图标内容，不改 Dock 列表几何 |
-| 增强 → Dockicon | 自动下移 | 6 图标时 Dock 列表下移，避免与上方内容拥挤 |
+| 增强 → Dockicon | Dock 图标上限 | 竖排 Dock 上限 5–8（6 为双机实测档，7/8 为实验档）；新增图标需手动拖入；切回更小上限后注销会自动把多余图标迁回主屏。图标大小/间距/上下位置请用第三方插件（如 Atria）调节 |
 | 增强 → 轮播铺满 | 轮播挂件铺满 | 复位 Solo 的 content scale fix（约 0.83），让小组件铺满 364×170 轮播背景；可能裁切小组件边缘 |
 
 所有功能均为运行时 hook，不修改 `Solo.dylib`。面板注入到 Solo 自带设置页的「增强」分组。
@@ -41,7 +39,7 @@ Solo+ 是 **Solo 1.0.1** 的运行时增强层，不修改 Solo 本体。
 ### 方式一：从源站装合并版（推荐）
 
 1. 添加源 `https://chenlin8023.github.io/`；
-2. 安装 **Solo1.0.1优化**（`com.chenlin8023.solo.full`，1.0.1-24）——包内含 Solo 1.0.1，安装时自动替换官方 Solo 与旧独立增强包（`Conflicts/Replaces`），不会双注入；
+2. 安装 **Solo1.0.1优化**（`com.chenlin8023.solo.full`，1.0.1-41）——包内含 Solo 1.0.1，安装时自动替换官方 Solo 与旧独立增强包（`Conflicts/Replaces`），不会双注入；
 3. respring。
 
 卸载合并包会一并移除 Solo 本体；需要时再从 Solo 官方源装回。后续升级只递增修订号（`1.0.1-2` …），`Package:` 不变。
@@ -70,10 +68,10 @@ MSYS_NO_PATHCONV=1 wsl -d Ubuntu-22.04 -- bash /mnt/d/path/to/SoloPlus/tools/ver
 
 ## 已知限制
 
-- **CC 收起回主屏瞬间状态栏闪切（保留残留）**：与 Lunora 共存时，CC 收起的一瞬会先呈现原生右列、随即替换为胶囊。1.3.9–1.3.12 四轮修复（CC 收起宽限期 / 记忆 rect 让位 / 转场起点武装 / frontDisplay 前台语境自证）日志实锤机制全部生效后闪切仍在——残留源头在 Lunora 自身转场内部，超出本插件可触及范围，**经实测确认后停工保留**。相关迭代存档于 CHANGELOG 1.3.9–1.3.12 与 `analysis/lunora-2b38/REPORT.md`；**源站发布口径保持 1.0.1-24（Solo+ 1.3.8），1.3.9–1.3.12 仅作本地存档不发布**。
-- Dock 拖动/换位仍有可感知卡顿，当前版本不再继续优化。
-- Dock 内放文件夹时不建议同时开启 6 图标；Atria/Solo 的文件夹布局与 6 槽组合存在不稳定风险。
-- 切回 5 图标并注销后，约 3 秒会把 Dock 最后一个图标迁回主屏第一处可放页面；若主屏无处可放，会保持 6 图标并写日志，不会强制踢出。
+- **CC 收起回主屏瞬间状态栏闪切（保留残留）**：与 Lunora 共存时，CC 收起的一瞬会先呈现原生右列、随即替换为胶囊。1.3.9–1.3.12 四轮修复（CC 收起宽限期 / 记忆 rect 让位 / 转场起点武装 / frontDisplay 前台语境自证）日志实锤机制全部生效后闪切仍在——残留源头在 Lunora 自身转场内部，超出本插件可触及范围，**经实测确认后停工保留**。相关迭代存档于 CHANGELOG 1.3.9–1.3.12 与 `analysis/lunora-2b38/REPORT.md`；1.3.9–1.3.12 的迭代结论已并入后续版本（源站现役 1.0.1-41 / Solo+ 1.3.25）。
+- Dock 图标大小、间距、上下位置由第三方插件（如 Atria）调节，本插件自 1.3.15 起不再提供这些能力，避免与调节插件互相覆盖。
+- Dock 内放文件夹时不建议同时开启 6+ 图标；Atria/Solo 的文件夹布局与多槽组合存在不稳定风险（1.3.14 已修文件夹 model 误判导致的错位与安全模式，已错位的历史布局需手动拖回）。
+- 切回更小图标上限并注销后，约 3 秒会把 Dock 多余图标迁回主屏第一处可放页面；若主屏无处可放，会保持现状并写日志，不会强制踢出。7/8 图标档为实验档，未做双机实测。
 - 轮播铺满会让小组件按原生尺寸填充背景，边缘可能被裁切；可在「轮播铺满」页关闭。
 - 数据标识替换只作用于 Duo 读数，不改系统状态栏。
 - 依赖 Solo 私有实现（`UnduoWidgetCarousel`、`SBDockIconListView`、`SBIconListModel` 等），Solo 或 iOS 升级后可能需要适配。
@@ -129,10 +127,10 @@ tools/verify_release.sh     # 发布前核验（原文件未改 / 双切片 / PA
 | 源 | `https://chenlin8023.github.io/` |
 | 显示名 | Solo1.0.1优化 |
 | Package | `com.chenlin8023.solo.full` |
-| 版本 | `1.0.1-24`（首个上架版 1.0.1-1；后续只递增修订号） |
+| 版本 | `1.0.1-41`（首个上架版 1.0.1-1；后续只递增修订号） |
 | 架构 | `iphoneos-arm64`（rootless，`/var/jb`） |
 | 替换 | `Conflicts/Replaces: com.oakstheawesome.solo, com.chenlin8023.soloplus` |
-| deb | `debs/com.chenlin8023.solo.full_1.0.1-24_iphoneos-arm64.deb` |
+| deb | `debs/com.chenlin8023.solo.full_1.0.1-41_iphoneos-arm64.deb` |
 
 源站索引只由 `root-site/tools/make_repo.py` 生成（`repo-meta.json` 为唯一元信息来源）；
 上架/更新流程：`build_release.sh` → `tools/verify_release.sh` → deb 入 `root-site/debs/` →

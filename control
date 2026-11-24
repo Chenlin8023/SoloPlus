@@ -1,6 +1,6 @@
 Package: com.chenlin8023.soloplus
 Name: Solo+ 增强包
-Version: 1.3.12
+Version: 1.3.25
 Architecture: iphoneos-arm64
 Section: Tweaks
 Priority: optional
@@ -9,7 +9,7 @@ Author: Chenlin8023
 Depends: mobilesubstrate, com.oakstheawesome.solo
 Description: Solo 1.0.1 的增量增强包（不修改 Solo 本体）。
  功能：保留系统状态栏 / Duo 显示与时间开关 / Duo 下方电量 / 数据标识（5G 小号 A）/
- Dockicon 6 图标与内容缩放 / 轮播挂件铺满。
+ Dock 图标上限 5-8 / 轮播挂件铺满。Dock 图标大小、间距与上下位置由第三方插件（如 Atria）调节，本包不再提供。
  依赖正式版 Solo 1.0.1；面板入口在 Solo 设置页的「增强」。
- 已知限制：Dock 重排偶有卡顿；Dock 内文件夹不建议同时开 6 图标；
+ 已知限制：Dock 内文件夹不建议同时开 6+ 图标；
  轮播铺满可能裁切小组件边缘。

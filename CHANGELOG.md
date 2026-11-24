@@ -3,6 +3,331 @@
 All notable changes to Solo+ are documented here.
 The project is an unofficial runtime enhancement layer for Solo 1.0.1.
 
+## 1.3.25 — 2026-11-25（锁屏左列活跟随胶囊"锁屏可见"开关）
+
+用户澄清胶囊有独立"锁屏可见"设置：ON 时锁屏左列由胶囊替换（Lunora 自渲染）；
+OFF 时锁屏左列默认原生——但当前实测仍被压制隐藏。此前 1.3.21 的静态归属规则
+（1.3.24 已撤）无法表达这个开关。1.0.1-39/40 实测确认的成果全部保留：keep=1
+主屏全量保活 ✓、关 Lunora 恢复 ✓、锁屏右列原生 ✓。
+
+- **锁屏还原扩展为左右双簇**（`sp_restore_lock_bar`，原右簇还原改名扩展）：
+  - 右簇（x≥195）恒还原，语义不变；
+  - 左簇活跟随：本实例 overlay 存在**有效左胶囊**（可见+真 frame+左半区，
+    即"锁屏可见=ON"的活证据）→ 压制原生左列（胶囊替换语义）；无左胶囊且
+    无第三方内容在场 → 还原原生左列（hidden/lh/alpha 全套）；
+- **第三方内容保护**：左半区存在类名首字母小写的可见视图（混淆类名特征，
+  如电话助手的 tZBkQAHVLGPTQwXC；系统/Lunora 类均大写开头）→ 左列归它，
+  不还原不压制——避免 1.3.19 叠放回归；
+- 已知边界维持：App 内胶囊×电话助手重合延后/配置规避（用户拍板）；Lunora
+  切换胶囊配置需其引擎自刷新（用户实测开关一次）。
+
+**验证矩阵**：胶囊开+锁屏可见 ON → 锁屏左列=胶囊；胶囊开+锁屏可见 OFF →
+锁屏左列=原生；胶囊关 → 锁屏左列=原生/电话助手替换；主屏双胶囊、关 Lunora
+恢复、App 内回归不变。
+
+## 1.3.24 — 2026-11-25（锁屏左列归属规则撤销：锁屏永不随胶囊）
+
+1.0.1-39 实测三态：关闭 Lunora 主屏恢复 ✓；Lunora 开+胶囊关全正常 ✓；锁屏
+右列原生 ✓。**剩余问题定位**：开启左胶囊时锁屏左列原生被隐藏——那是 1.3.21
+的"左胶囊在场→锁屏压制原生左列"规则在生效，而用户本轮期望已明确：**锁屏
+左列永远该是原生/电话助手替换态，胶囊不进锁屏**（Lunora 本就不在锁屏渲染
+胶囊）。1.3.21 那条规则按当时"叠加"现象反推，方向反了，整体撤销。
+
+- **撤销锁屏左列归属**：删除 `gThemeLeftCapsuleSeen` 标记、
+  `sp_note_capsules_gone()` 及全部调用点、`sp_restore_right_cluster` 的左列
+  压制块——锁屏还原回到 1.3.20 语义（只动 x≥195 右簇，左列不碰）。
+- 锁屏左列最终语义：**原生为底，电话助手"锁屏可见"时由其替换**（in-place，
+  自己管理），任何情况下不受 Lunora 胶囊配置影响。
+- 已知边界不变：App 内左胶囊×电话助手重合 = 进程边界（App 状态栏由 App
+  进程渲染），非 SpringBoard 侧可修； Lunora 关闭/切换左胶囊后需其自身
+  状态刷新（用户实测需开关一次 Lunora，属其引擎行为）。
+- 1.3.23 的 keep=1 主屏全量保活继续生效（报告(11) L242-249 实证拦截正常）。
+
+**验证要点**：开启左胶囊时锁屏左列恢复原生/电话助手替换显示；主屏双胶囊、
+关闭 Lunora 主屏恢复、App 内（已知重合）回归不变。
+
+## 1.3.23 — 2026-11-25（keep=1 主屏全量保活：修关闭 Lunora 后主屏无状态栏）
+
+用户三态实测判读：Lunora 开+胶囊关 ✓（共存成立）；锁屏左胶囊右原生 ✓（归属
+模型成立）；**Lunora 关 → 主屏状态栏整体消失** ✗。
+
+根因：关闭 Lunora 只是它的 overlay 消失，引擎与钩子仍在运行、压暗指令照发
+（dylib 无法卸载）。此前主屏 hide 路径的最终分支把"caller=other 且无主题覆盖"
+当作系统自身行为**放行**——Lunora 的压暗恰好落到这个分支 → 原生栏被隐藏且
+无任何状态栏可看（报告(8) L160/260/401 实证）。
+
+- **keep=1 主屏全量保活**：主屏语境的整条隐藏（alpha→0）一律拦回（caller=
+  solo/other 一视同仁），主题在场时照旧附带让位。keep=0 不受影响（更早放行
+  归 Solo）。日志改为 `blocked statusbar hide ... (no theme, keep=1)`。
+- 已知边界（非本包可修）：**App 内**左胶囊与电话助手内容重合——App 状态栏
+  由 App 进程渲染，SpringBoard 注入的 SoloPlus/Lunora-电话助手仲裁都够不到；
+  属 Lunora×电话助手的 App 内冲突，需其二者配置规避或未来做按 App 注入的
+  独立模块。
+
+**验证要点**：关闭 Lunora（不注销）后主屏状态栏立即恢复且稳定；开启后双胶囊
+照常；锁屏/App 内回归不变。
+
+## 1.3.22 — 2026-11-25（三者归属模型定案：护栏语境收口 + 胶囊态解除自愈）
+
+用户定案三层形态语义——**Solo**＝原生栏总开关（keepStatusBar 门控其整条隐藏）；
+**电话助手**＝在原生栏内 in-place 修改，改哪侧替哪侧（原生载体保持可见即是其
+显示形态，对 SoloPlus 透明，无需特殊处理）；**Lunora**＝压制原生 + 悬浮胶囊，
+按侧生效。对 SoloPlus 而言每侧只有两态：Lunora 占有（压原生）与非 Lunora
+（原生载体不动）。优先级 Lunora > 电话助手 > 原生。
+
+- **护栏语境收口**：1.3.18 把 SBMainSwitcherWindow 无条件纳入锁屏护栏，解锁
+  状态下把 Lunora 的主屏样式（整条压暗+胶囊悬浮）也拦死了（报告(6) L487-496
+  ×10 实证）。1.3.22 起护栏与还原共用同一判定 `sp_should_restore_lock_bar`：
+  CoverSheet 恒定，MainSwitcher/StatusBarWindow 仅 UI 锁定时——解锁态切换器
+  回归主屏规则（keep=1 按共存规则拦+让位；keep=0 放行归 Solo）。
+- **胶囊态解除自愈**：`sp_sb_assert_on_layout` 主屏路径"overlay 在但胶囊失效
+  且不在宽限"此前什么都不做，让位 alpha=0 滞留——这就是"关闭 Lunora 后右侧
+  不显示原生"的直接原因。现在该分支收回让位；show/attach 的主屏无覆盖层路径
+  同步补齐。
+- **左列归属标记精确化**：新增 `sp_note_capsules_gone()`，只在主屏语境观测到
+  胶囊态解除时清 `gThemeLeftCapsuleSeen`；语境切换类 restore（App 内/锁屏）
+  不清——否则锁屏期间左列压制被误解除（叠加回归）。
+- 1.3.21 的锁屏左列归属、右簇还原 x≥195、锁定闸右半区限定、双点取证全部
+  继续生效。
+
+**验证要点**：① 关闭 Lunora（建议注销一次）后主屏右列原生回归；② 主屏双胶囊
+照常（含切换器手势时的切换器栏）；③ 锁屏右列原生 + 左列随归属（左胶囊启用压
+原生左列 / 左列电话助手时显示其内容）；④ App 内状态栏完整。
+
+## 1.3.21 — 2026-11-25（锁屏左列归属：Lunora 左胶囊启用时压制原生左列）
+
+用户澄清三层形态与优先级模型：纯原生 < 电话助手修改（in-place 替换语义）<
+Lunora 自绘（隐藏语义）；**Lunora > 电话助手 > 原生**。左列从电话助手切换为
+Lunora 胶囊后，锁屏左侧出现原生叠加——1.3.19 的锁定让位闸 blanket restore
+把左簇也收回来了（左胶囊启用后左列内容同样被让位过），原生左列与胶囊同屏。
+1.3.20 的右列修复（x≥195）保持不变且继续有效。
+
+- **左胶囊在场标记**（`gThemeLeftCapsuleSeen`）：主屏让位时记录最近一次
+  Lunora 胶囊布局是否含左半区（x<195）有效胶囊——作为"左列归属 Lunora"的
+  配置观测（关闭左胶囊后标记自动清除，电话助手 in-place 内容照常显示）。
+- **锁屏左列随归属**：`sp_restore_right_cluster` 在还原语境下，若左胶囊在场
+  则压制原生左列（alpha→0，只压 alpha 不动 hidden）；无左胶囊时不触碰左半区。
+- **锁定闸改右半区限定**：`sp_apply_theme_yield` 锁定期间只收回 x≥195 的
+  让位子视图，左簇保持让位态，由还原函数统一裁决——消除 blanket restore
+  造成的叠加。
+- **日志预算扩容**（防深会话失明）：lock guard 8→24、attach dump 2→6、
+  终态取证 4→8；`lock restore` 行追加 `leftCaps=` 字段。
+
+**验证要点**：锁屏左列只显示 Lunora 胶囊（无原生叠放）；右列原生继续正常；
+左列切回电话助手后锁屏左列恢复其内容；回主屏双胶囊照常。若锁屏左列变为
+空白（Lunora 不在锁屏渲染胶囊），反馈后把左列归属改为"锁屏保持原生"。
+
+## 1.3.20 — 2026-11-25（右簇还原收窄到 x≥195：修左列叠放）
+
+1.3.19 实机反馈：锁屏右列原生已正常显示（右簇修复成立），但**左列叠放**——
+还原把左列 STUIStatusBar*（时间 StringView 等）也一并复位了，而该用户的
+Lunora 配置（左原生/右胶囊）下，左列被 Solo 锁屏内容"替换原生"是正常形态
+（报告(29) L363：主屏样式实例里左 StringView 本就是 hidden=1）。
+
+- **还原范围收窄**：`sp_restore_right_cluster` 的 STUIStatusBar* 分支加
+  `frame.origin.x >= 195` 门槛——只还原右簇（信号 x=282 / 网络类型 x=308 /
+  电池 x=333）；左列保持各语境自己的样式（Solo 替换态/原生态互不打架）。
+  cell 容器与 Luma 背板分支本来就是 x≥195，不变。
+- 其余（让位闸、三点位、护栏、取证）随 1.3.19 继续生效。
+
+**验证要点**：锁屏右列仍正常；锁屏左列不再叠放（只显示 Solo 修改内容）；
+回主屏 Lunora 右胶囊照常。
+
+## 1.3.19 — 2026-11-25（锁屏右簇还原：修"从主屏锁屏右列消失"）
+
+报告(29) 定案机制：**锁屏栏显示的是"锁屏前语境"样式的实例**。同一前景视图
+实例在 CoverSheet（被护栏保住、全原生可见）与 SBMainSwitcherWindow 之间迁移；
+后者被抓拍到完整主屏样式包：右列信号/网络类型/电池 `hidden=1 lh=1`、右 cell
+容器与右 Luma 背板 `alpha=0`、Lunora 右胶囊可见（带自己的电池 widget）。从主屏
+锁屏 → 实例带主屏样式（右簇被压制）→ 锁屏场景 Lunora 不画胶囊 → 右侧干净彻底
+消失；从 App 锁屏 → 实例是 App 样式（原生完整）→ 正常。左列不受影响（用户配置
+左列=原生）。另有自伤实证：锁定边缘我们的让位把 x=333（锁屏布局）电池 alpha0
+（报告(29) L324）。
+
+- **右簇还原**（`sp_restore_right_cluster`）：锁屏语境下把右列恢复成原生可见
+  ——`STUIStatusBar*` 直接子级 hidden/lh/alpha 复位；右半区（x≥195）cell 容器
+  与 Luma 背板 alpha<0.01 复位 1.0；不碰 `LNV2*`；`UIVectorLabel`（合法备选
+  渲染，嵌在 item 内部）不动。
+- **还原语境判定**（`sp_should_restore_lock_bar`）：CoverSheet 恒还原；
+  MainSwitcher/StatusBarWindow 仅 UI 锁定时还原（解锁状态下它们承载主屏/
+  切换器样式，还原会砸掉 Lunora 胶囊态）。
+- **三个点位接线**：attach、layoutSubviews（单向重申，对打 Lunora 引擎的
+  重申压制）、护栏拦回之后。
+- **让位闸**：`sp_apply_theme_yield` 在 UI 锁定时改为顺手 restore 并返回——
+  锁定期间不让位（自伤路径封死）；解锁后由 show/layout 重新套用，自愈。
+- 独立于保留系统栏开关；1.3.18 的护栏/dump/祖先链全部继续生效。
+
+**验证要点**：主屏下拉锁屏、主屏真锁屏后亮屏，右列（信号/网络/电池）均应
+稳定显示；从 App 锁屏回归不变；回主屏后 Lunora 右胶囊照常；解锁瞬间无闪烁。
+
+## 1.3.18 — 2026-11-25（护栏覆盖切换器语境 + 终态双点采样 + 祖先链）
+
+报告(27) 判读（1.0.1-33/1.3.17 实机）：护栏实锤 **Lunora 反复压暗锁屏栏**
+（`lock guard: kept hide ... caller=other` ×8，全被顶回）；两次 `sbdump-later`
+（+0.6s）里右列信号/网络类型/电池全部 alpha=1/hidden=0/lh=0/mask=0，且
+LNV2OverlayView 全幅骑进锁屏栏（z=1，胶囊 hidden）——视图级状态与肉眼观察
+矛盾。两个盲区：采样只到 +0.6s；可见栏可能是 `SBMainSwitcherWindow` 实例
+（1.3.17 只护 CoverSheet，其 alpha→0 在非主屏语境照样放行）。
+
+- **护栏扩窗口**：新增 `sp_window_is_lock_context()`（SBCoverSheetWindow ∪
+  SBMainSwitcherWindow），两个锁屏语境的任何来源 alpha→0 一律保活+归因
+  （日志带 win=）。
+- **终态双点采样**：`sbdump-later` 由单点 0.6s 改为 0.6s/2.5s 双点（预算 4），
+  捕更晚到的压制；CFRunLoopTimer C 回调零 block。
+- **祖先链**：每轮终态 dump 先从栏向上逐级打印到窗口（alpha/hidden/lh/mask），
+  堵"上级视图被藏"盲区。
+- 1.3.17 的 any-source 拦截、lh/mask 字段、attach dump 继续生效。
+
+**下一轮判定**：MainSwitcher 栏的 guard 触发 + 右列恢复 → 收案；+2.5s 采样
+出现异常（mask=1 / lh=1 / alpha<1）→ 定位到具体机制；祖先链出现非 1 值 →
+上级视图级压制；全部正常而肉眼仍消失 → 转视觉层（LNV2OverlayView 玻璃盖
+覆盖）与 Lunora 配置方向。
+
+## 1.3.17 — 2026-11-25（锁屏护栏扩权 + 终态取证）
+
+报告(26) 判读（1.0.1-32/1.3.16 实机）：护栏版在跑（`sbhook ownership: top=ours`），
+锁屏栏容器 `alpha=1 hidden=0` 完整可见，但**右列 item 缺席**（attach 时刻只剩零尺寸
+空壳），且全程**零 caller=solo alpha 调用**——1.3.16 的 caller=solo 拦截无从发力，
+真凶未定（caller=other 的 alpha 调用，或 Lunora 的 layer mask 所有权——dump 的
+view 级字段看不见 mask）。
+
+- **护栏扩权**：CoverSheet 语境对**任何来源**的 alpha→0 一律保活（`alpha` 强制
+  1.0）并记归因（`caller=solo/other` + `uiLocked`）。Lunora 转场级 alpha 交接
+  嫌疑最大（它在锁屏栏不画 overlay 却疑似照压原生右列）。
+- **dump 加 layer 字段**：每行追加 `lh=<layer.hidden> mask=<layer.mask 非空>`；
+  view 级 alpha/hidden 全正常但 mask=1 = Lunora mask 所有权压制的直接证据。
+- **终态二次取证**：CoverSheet 前景视图 attach 后 0.6s 对同一视图再 dump 一次
+  （`sbdump-later`，预算 2）——attach 时刻 item 尚未组装（报告(26) L1109 实证
+  零尺寸空壳），"闪现后被藏"只存在于终态。CFRunLoopTimer C 回调，零 block 字面量。
+- 1.3.16 的锁屏护栏、`sp_device_ui_locked()`、锁屏 attach dump 继续生效。
+
+**判定树（下一轮日志）**：`lock guard: kept hide ... caller=other` 有触发且右列
+恢复 → alpha 级压制实锤已修；归因=other 拦了仍被藏 → 看 `sbdump-later` 的
+mask=1（mask 级，Lunora 内部，需另行评估）；item 始终零尺寸 → 工厂级
+（Lunora `viewForIdentifier:` 压制，Solo 已排除——其 hook 表无 item 工厂钩子）。
+
+## 1.3.16 — 2026-11-25（锁屏护栏：锁屏系统栏不再被 Solo 渐隐，独立于保留系统栏开关）
+
+调试报告(23) 用户报障：**锁屏上的右侧系统栏被强制隐藏**，且关闭「保留系统栏」
+也不恢复。逆向定位（Solo 1.0.1 反编译 FUN_00052bf4 + 报告(23) 行 159/167）：
+
+- Solo 的 stockstatusbar 评估器在 `isUILocked==0 && !CC && 无前台 App` 时对
+  **全部已跟踪状态栏**（含 `SBCoverSheetWindow` 里锁屏那条，weak 表不分类）
+  做 `setAlpha:0` 渐隐；锁屏左边为空，视觉上就是"右列消失"。
+- `isUILocked` 与 CoverSheet 呈现有错位窗口期（报告(23)：息屏瞬间
+  `UI locked=0`，亮屏瞬间 `device lock state=0, UI locked=1`——两层锁语义错位）。
+- 旧代码两种模式都不设防：`keepStatusBar=0` 时 hide 路径整体放行；
+  `keepStatusBar=1` 时非主屏语境（含锁屏）也放行。
+
+改动：
+
+- **锁屏护栏**（`sp_common_set_alpha`）：窗口类为 `SBCoverSheetWindow` 时，
+  `caller=solo` 的隐藏一律拦回（`alpha` 强制 1.0），**独立于 keepStatusBar 开关**；
+  非 Solo 来源（系统/Lunora 转场）仍放行，不与其转场对抗。
+- **锁屏取证**：CoverSheet 前景视图 attach 时 dump 子树（预算 2 次，两种开关
+  模式下都生效）。若护栏日志零触发而锁屏仍被藏，即为 Lunora 工厂层压制
+  （item 视图根本不创建，alpha 钩子不可见）的实锤——下一轮转向 Lunora 侧。
+- 新增 `sp_device_ui_locked()`（与 Solo 评估器同源读 `SBLockScreenManager
+  isUILocked`，仅供日志对照锁态口径）与 `gLockGuardLogBudget`（8 条）。
+
+**待实机验证**：锁屏亮屏后右列（电池/WiFi/信号）始终可见；锁→解锁→再锁
+循环无残留；保留系统栏开/关两种模式下行为一致。
+
+## 1.3.15 — 2026-11-25（Dock 功能瘦身：只保留图标上限，扩展到 5–8）
+
+用户定案：发现第三方插件（Atria 等）可完成 Solo Dock 图标的大小/间距/上下位置
+调节，Solo+ 侧重复实现会互相覆盖。**Dock 模块瘦身为只保留「图标上限」**，
+上限从 5/6 扩展到 **5–8**。
+
+- **删除**：`soloPlusDockIconScale` 全链（`iconContentScale` 应用、父层 transform、
+  `UnduoDockScale` 动画补偿、1.3.13 的 CFRunLoopTimer 合并重应用）与
+  `soloPlusDockAutoShift`（`setCenter:` 下移）；面板「图标大小」「自动下移」两项；
+  `sp_model_location` 死代码与全部缩放日志预算。
+- **保留**：`sp_dock_layoutIconsNow` / `sp_dock_layoutSubviews` 钩子本身——它们
+  现在只剩一个职责：刷新 `gDockListView` / `gDockModel`（模型层严格指针身份的
+  唯一数据源，删掉会让文件夹 model 误判回归，即调试报告(20) 的 count=5 错位）；
+  上限容量链（视图 `maximumIconCount`/`iconRows`，模型 `maxNumberOfIcons`/
+  `numberOfFreeSlots`/`gridSize`/`isFull`/insert 边界）、6→5 自动迁回、
+  `addPlaceholder` 终点防护与 NSNotFound 前置拒绝。
+- **上限 5–8**：`sp_load_prefs` 夹取上限 8；面板新增 7/8 档位；7/8 为超出实测
+  范围的实验档（6 为双机实测档）。
+- 面板 footer 与 control/README/发布描述注明：Dock 图标大小、间距、上下位置
+  请用第三方插件（如 Atria）调节。
+- 1.3.14 的严格指针身份与 NSNotFound 前置拒绝随本版继续生效。
+
+**待实机验证**：8 图标档可用性；缩放/下移移除后 Dock 视觉由 Atria 接管无回归；
+文件夹首页满拖入不再错位（1.3.14 修复的延续验证）。
+
+## 1.3.14 — 2026-11-25（文件夹错位根因：Dock model 严格指针身份；1.0.1-29 实机回执驱动）
+
+调试报告(20)（1.0.1-29 上机）实锤两件事：
+
+- **安全模式已修成**：`[Solo+] placeholder: caught invalid grid cell index 9223372036854775807` × 6，
+  正是 `.ips` 里 `addPlaceholderAtGridCellIndex:` 的 NSAssert 异常被 1.3.13 的
+  终点 `@try/@catch` 拦下，拖移不再 abort。用户回执「托移不会进入安全模式」与此一致。
+- **错位根因定位**：日志出现 `dock model gridSize: count=5 cols=1 rows=6 -> {1,6}` ——
+  该行只在 `sp_model_is_dock()` 为真时打印，但 Dock 实为 6 图标；`count=5` 来自
+  **被误判的文件夹内部 model**。旧 `sp_model_is_dock()` 在 `gDockListView` weak 变 nil
+  时回落 `_atriaLocation` 含 "Dock" 就认，于是文件夹 model 的 `gridSize` 被套成
+  竖排 `{1,6}`、`freeSlots/isFull/maxIcons` 一起放大 → 已满首页认为还有一行槽 →
+  拖入应用排到「下一行」而非新建一页 → 坐标 NSNotFound → 异常（旧包 abort 进安全模式）
+  / 图标错位持久化（注销不回滚，因状态已落盘）。
+
+本版修改（一个变量：只认真正的 Dock model）：
+
+- `sp_model_is_dock()` 改为**严格指针身份**，只匹配 `gDockModel`；未就绪时
+  model 层一律不改，视图层 `sp_dock_max`/`sp_dock_rows` 已兜底，绝不误伤文件夹；
+  `sp_dock_model()` 不再扫窗口（避免拿到残旧列表的过期 model），由
+  `sp_note_dock_list()` 在每次 Dock 布局钩子里刷新 `gDockModel`；
+- 终点 hook 增加 **NSNotFound 前置拒绝**：系统算出 `0x7FFFFFFFFFFFFFFF` 落点时
+  直接返回 nil，不进 SpringBoardHome、不抛异常、不留半状态（比 `@try/@catch`
+  更干净）；原有全列表 `@try/@catch` 兜底保留。
+
+**预期**：新拖入不再产生错位；已经错位的历史图标状态由用户手动拖入下一页恢复
+（用户已实机验证该操作有效），插件不主动改写用户图标布局数据。
+**待实机验证**：文件夹首页满时重复拖入不再错位、Dock 6 图标能力不回退。
+
+## 1.3.13 — 2026-11-24（Dock 模型-视图一致性 + 缩放合并；未实机验证）
+
+状态栏方向：结合 owngoal-dev/SingleVPN 开源源码（纯 item 级 hook，无 CC 转场/
+overlay 杠杆）、Lunora V2 逆向报告与 1.3.9–1.3.12 四轮补丁材料复核，确认
+CC 收起闪切残留源头在 Lunora 自身转场内部，SoloPlus 边界已到，**无突破性
+优化可做，本版不动状态栏代码**。
+
+转向 Dock 两处遗留问题，依据新附的 SpringBoard-2026-11-24-175924.ips：
+
+- 崩溃链：`SBIconDragManager iconView:willAnimateDragLift…` →
+  `SBIconListView addPlaceholderRepresentingIcon:` →
+  `addPlaceholderAtGridCellIndex:` 内 NSAssert 抛异常 → `SIGABRT`；
+  `consecutiveCrashCount=3` → 安全模式。异常栈全在系统框架内、无 tweak 帧，
+  是模型容量/网格索引与视图槽位不一致引发的间接断言。
+
+**A 组：桌面图标错误 / 安全模式（一个变量：收敛模型与视图的索引账本）**
+
+- `gDockModel` 直接记住 Dock model 指针：`gDockListView` 是 weak，CC 转场/
+  编辑态重建列表时短暂变 nil 会回落 `_atriaLocation` 误判身份；
+- `gridSize`：Atria 哨兵值（>1000）不再覆盖；视图报告 cols/rows 时长轴必须
+  容纳有效槽数（6 图标时旧实现照抄视图 1×5）；列表不可得时兜底严格竖排
+  `1×want`，不再把 `1×6` 写成横排 `6×1`；
+- `numberOfFreeSlots` 由 `NSUIntegerMax` 改为真实剩余槽数（定长网格不能报无限）；
+- `canAddIcon:atIndex:` / `insertIcon:atIndex:` / `insertIcons:atIndex:options:`
+  统一以 `idx < 有效槽数` 为硬边界，insert 再加 `@try/@catch` 兜底闸门，
+  模型内部断言绝不冒泡到 CFRunLoop；
+- 崩溃栈终点防护：钩 `SBIconListView addPlaceholderAtGridCellIndex:
+  representingIcon:reason:options:`（arity=6 + 返回对象守卫，签名漂移不装），
+  仅对 Dock 列表拦越界 index 并 `@try/@catch`，其它列表原样转发。
+
+**B 组：Dock 六图标动画卡顿（独立变量：缩放重应用时机）**
+
+- 旧实现在 `layoutSubviews` / `layoutIconsNow` 回调栈内同步递归整棵 Dock 视图树
+  写 `iconContentScale`，写入又触发新布局，形成「布局→遍历+写→再布局」反馈循环；
+- 改为 CFRunLoopTimer 合并同一轮次多次请求、延后到 runloop 空闲一次性应用；
+  布局回调在 `spApplyingDockListScale` 期间跳过 arm 断开环路；
+  启动/列表未挂载时有界重试（6×0.25s）；缩放值与几何行为不变；
+- 全程 C 回调，无 block 字面量（1.2.0 安全模式硬教训）。
+
+**状态：仅本地编译自检，未实机验证。不发包、不推 GitHub、不推源站。**
+
 ## 1.3.12 — 2026-11-24（桌面语境自证武装：attach 就地开宽限，不再追事件时序）
 
 1.3.11 实机日志（attach 带 grace 状态）实锤：SBStatusBarWindow 的 attach 全部
